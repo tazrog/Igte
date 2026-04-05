@@ -1,3 +1,6 @@
 <resources>
-    <string name="app_name">IvE</string>
+    <string name="app_name">Income&gt;Expense</string>
+    <string name="year_income_expense_widget_title">%1$d Income &gt; Expense</string>
+    <string name="year_income_expense_widget_description">Shows the current year Income &gt; Expense total.</string>
+    <string name="year_income_expense_widget_empty">No entries for this year yet.</string>
 </resources>

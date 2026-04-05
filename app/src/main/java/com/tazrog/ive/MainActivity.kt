@@ -1,16 +1,23 @@
 package com.tazrog.ive
 
+import android.app.AlarmManager
 import android.app.DatePickerDialog
+import android.app.PendingIntent
+import android.app.TimePickerDialog
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -48,17 +55,14 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -74,14 +78,17 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.isSystemInDarkTheme
 import com.tazrog.ive.ui.theme.IvETheme
@@ -109,6 +116,27 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+class AutoBackupReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        when (intent?.action) {
+            Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED,
+            null -> AutoBackupScheduler.sync(context)
+            else -> {
+                runCatching {
+                    val backupUri = FinanceStorage.createAutoBackupDocument(context)
+                    FinanceStorage.exportBackup(
+                        context = context,
+                        uri = backupUri,
+                        backupData = FinanceStorage.buildBackupData(context)
+                    )
+                }
+                AutoBackupScheduler.sync(context)
+            }
+        }
+    }
+}
+
 private enum class TransactionType {
     INCOME,
     EXPENSE
@@ -119,7 +147,7 @@ private enum class AppSection(val title: String, val subtitle: String) {
     CATEGORIES("Categories", "Manage the categories available for your transactions."),
     STATS("Stats", "View summaries and charts by month, year, and category."),
     TRANSACTIONS("Transactions", "Search, edit, and remove saved transactions."),
-    HINTS("Hints", "Read simple guidance for using IvE."),
+    HINTS("Hints", "Read simple guidance for using I>E."),
     SETTINGS("Settings", "Choose your currency, theme, backups, and hints.")
 }
 
@@ -182,6 +210,7 @@ private data class BackupData(
 )
 
 private const val allYearMonth = -1
+private const val MAX_CATEGORY_NAME_LENGTH = 10
 
 private enum class ThemeMode(val label: String) {
     SYSTEM("Use System"),
@@ -201,6 +230,9 @@ private object FinanceStorage {
     private const val KEY_CURRENCY = "currency"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_HINTS_ENABLED = "hints_enabled"
+    private const val KEY_AUTO_BACKUP_ENABLED = "auto_backup_enabled"
+    private const val KEY_AUTO_BACKUP_MINUTES = "auto_backup_minutes"
+    private const val KEY_AUTO_BACKUP_TREE_URI = "auto_backup_tree_uri"
 
     private val defaultCategories = listOf(
         "Salary",
@@ -261,6 +293,7 @@ private object FinanceStorage {
             )
         }
         prefs(context).edit().putString(KEY_ENTRIES, array.toString()).apply()
+        YearIncomeExpenseWidgetUpdater.updateAll(context)
     }
 
     fun loadCurrencyCode(context: Context): String {
@@ -269,6 +302,7 @@ private object FinanceStorage {
 
     fun saveCurrencyCode(context: Context, currencyCode: String) {
         prefs(context).edit().putString(KEY_CURRENCY, currencyCode).apply()
+        YearIncomeExpenseWidgetUpdater.updateAll(context)
     }
 
     fun loadThemeMode(context: Context): ThemeMode {
@@ -286,6 +320,56 @@ private object FinanceStorage {
 
     fun saveHintsEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_HINTS_ENABLED, enabled).apply()
+    }
+
+    fun loadAutoBackupEnabled(context: Context): Boolean {
+        return prefs(context).getBoolean(KEY_AUTO_BACKUP_ENABLED, false)
+    }
+
+    fun saveAutoBackupEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_AUTO_BACKUP_ENABLED, enabled).apply()
+    }
+
+    fun loadAutoBackupMinutes(context: Context): Int {
+        return prefs(context).getInt(KEY_AUTO_BACKUP_MINUTES, 2 * 60)
+    }
+
+    fun saveAutoBackupMinutes(context: Context, minutes: Int) {
+        prefs(context).edit().putInt(KEY_AUTO_BACKUP_MINUTES, minutes).apply()
+    }
+
+    fun loadAutoBackupTreeUri(context: Context): String? {
+        return prefs(context).getString(KEY_AUTO_BACKUP_TREE_URI, null)
+    }
+
+    fun saveAutoBackupTreeUri(context: Context, uri: String?) {
+        prefs(context).edit().putString(KEY_AUTO_BACKUP_TREE_URI, uri).apply()
+    }
+
+    fun buildBackupData(context: Context): BackupData {
+        return BackupData(
+            categories = loadCategories(context),
+            entries = loadEntries(context),
+            currencyCode = loadCurrencyCode(context),
+            themeMode = loadThemeMode(context),
+            hintsEnabled = loadHintsEnabled(context)
+        )
+    }
+
+    fun createAutoBackupDocument(context: Context): Uri {
+        val treeUri = loadAutoBackupTreeUri(context)?.let(Uri::parse)
+            ?: error("Select a backup folder before enabling automatic backup.")
+        val treeDocumentUri = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri)
+        )
+        val fileName = "ive-backup-${backupFileTimestamp()}.json"
+        return DocumentsContract.createDocument(
+            context.contentResolver,
+            treeDocumentUri,
+            "application/json",
+            fileName
+        ) ?: error("Unable to create the automatic backup file.")
     }
 
     fun exportBackup(context: Context, uri: Uri, backupData: BackupData) {
@@ -382,6 +466,45 @@ private val commonCurrencies = listOf(
 )
 
 private const val defaultCurrencyCode = "USD"
+private const val autoBackupRequestCode = 4201
+
+private object AutoBackupScheduler {
+    fun sync(context: Context) {
+        if (!FinanceStorage.loadAutoBackupEnabled(context) ||
+            FinanceStorage.loadAutoBackupTreeUri(context).isNullOrBlank()
+        ) {
+            cancel(context)
+            return
+        }
+
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmManager.cancel(pendingIntent(context))
+        alarmManager.setAndAllowWhileIdle(
+            AlarmManager.RTC_WAKEUP,
+            nextAutoBackupTriggerAt(FinanceStorage.loadAutoBackupMinutes(context)),
+            pendingIntent(context)
+        )
+    }
+
+    fun cancel(context: Context) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pendingIntent = pendingIntent(context)
+        alarmManager.cancel(pendingIntent)
+        pendingIntent.cancel()
+    }
+
+    private fun pendingIntent(context: Context): PendingIntent {
+        val intent = Intent(context, AutoBackupReceiver::class.java).apply {
+            action = "com.tazrog.ive.AUTO_BACKUP"
+        }
+        return PendingIntent.getBroadcast(
+            context,
+            autoBackupRequestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+}
 
 @Composable
 private fun FinanceTrackerApp() {
@@ -391,6 +514,9 @@ private fun FinanceTrackerApp() {
     var currencyCode by rememberSaveable { mutableStateOf(defaultCurrencyCode) }
     var themeMode by rememberSaveable { mutableStateOf(ThemeMode.SYSTEM.name) }
     var hintsEnabled by rememberSaveable { mutableStateOf(true) }
+    var autoBackupEnabled by rememberSaveable { mutableStateOf(false) }
+    var autoBackupMinutes by rememberSaveable { mutableStateOf(2 * 60) }
+    var autoBackupTreeUri by rememberSaveable { mutableStateOf<String?>(null) }
     var showTitleScreen by rememberSaveable { mutableStateOf(true) }
     val selectedThemeMode = ThemeMode.valueOf(themeMode)
     val useDarkTheme = when (selectedThemeMode) {
@@ -407,6 +533,10 @@ private fun FinanceTrackerApp() {
         currencyCode = FinanceStorage.loadCurrencyCode(appContext)
         themeMode = FinanceStorage.loadThemeMode(appContext).name
         hintsEnabled = FinanceStorage.loadHintsEnabled(appContext)
+        autoBackupEnabled = FinanceStorage.loadAutoBackupEnabled(appContext)
+        autoBackupMinutes = FinanceStorage.loadAutoBackupMinutes(appContext)
+        autoBackupTreeUri = FinanceStorage.loadAutoBackupTreeUri(appContext)
+        AutoBackupScheduler.sync(appContext)
         delay(1800)
         showTitleScreen = false
     }
@@ -423,6 +553,7 @@ private fun FinanceTrackerApp() {
                     val exists = categories.any { it.equals(cleaned, ignoreCase = true) }
                     when {
                         cleaned.isBlank() -> "Category name is required."
+                        cleaned.length > MAX_CATEGORY_NAME_LENGTH -> "Category names can be up to $MAX_CATEGORY_NAME_LENGTH characters."
                         categories.size >= 30 -> "You can save up to 30 categories."
                         exists -> "That category already exists."
                         else -> {
@@ -440,6 +571,7 @@ private fun FinanceTrackerApp() {
                     }
                     when {
                         cleaned.isBlank() -> "Category name is required."
+                        cleaned.length > MAX_CATEGORY_NAME_LENGTH -> "Category names can be up to $MAX_CATEGORY_NAME_LENGTH characters."
                         exists -> "That category already exists."
                         else -> {
                             val categoryIndex = categories.indexOfFirst { it == oldName }
@@ -483,6 +615,24 @@ private fun FinanceTrackerApp() {
                 onHintsEnabledChange = { enabled ->
                     hintsEnabled = enabled
                     FinanceStorage.saveHintsEnabled(appContext, enabled)
+                },
+                autoBackupEnabled = autoBackupEnabled,
+                onAutoBackupEnabledChange = { enabled ->
+                    autoBackupEnabled = enabled
+                    FinanceStorage.saveAutoBackupEnabled(appContext, enabled)
+                    AutoBackupScheduler.sync(appContext)
+                },
+                autoBackupMinutes = autoBackupMinutes,
+                onAutoBackupMinutesChange = { minutes ->
+                    autoBackupMinutes = minutes
+                    FinanceStorage.saveAutoBackupMinutes(appContext, minutes)
+                    AutoBackupScheduler.sync(appContext)
+                },
+                autoBackupTreeUri = autoBackupTreeUri,
+                onAutoBackupTreeUriChange = { treeUri ->
+                    autoBackupTreeUri = treeUri
+                    FinanceStorage.saveAutoBackupTreeUri(appContext, treeUri)
+                    AutoBackupScheduler.sync(appContext)
                 },
                 onAddEntry = { entry ->
                     entries.add(0, entry)
@@ -537,6 +687,12 @@ private fun FinanceTrackerScreen(
     onThemeModeChange: (ThemeMode) -> Unit,
     hintsEnabled: Boolean,
     onHintsEnabledChange: (Boolean) -> Unit,
+    autoBackupEnabled: Boolean,
+    onAutoBackupEnabledChange: (Boolean) -> Unit,
+    autoBackupMinutes: Int,
+    onAutoBackupMinutesChange: (Int) -> Unit,
+    autoBackupTreeUri: String?,
+    onAutoBackupTreeUriChange: (String?) -> Unit,
     onAddEntry: (FinanceEntry) -> Unit,
     onUpdateEntry: (FinanceEntry) -> Unit,
     onDeleteEntry: (String) -> Unit,
@@ -546,10 +702,8 @@ private fun FinanceTrackerScreen(
     val calendar = remember { Calendar.getInstance() }
     val currentYear = calendar.get(Calendar.YEAR)
     val currentMonth = calendar.get(Calendar.MONTH)
-    val drawerState = rememberDrawerState(initialValue = androidx.compose.material3.DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
-    var currentSection by rememberSaveable { mutableStateOf(AppSection.HOME.name) }
     var selectedType by rememberSaveable { mutableStateOf(TransactionType.EXPENSE) }
     var selectedDateMillis by rememberSaveable { mutableStateOf(todayAtMidnight()) }
     var selectedCategory by rememberSaveable { mutableStateOf("") }
@@ -566,6 +720,7 @@ private fun FinanceTrackerScreen(
     var pendingCategoryDelete by rememberSaveable { mutableStateOf<PendingCategoryDelete?>(null) }
     var pendingTransaction by rememberSaveable { mutableStateOf<PendingTransaction?>(null) }
     var pendingImportBackup by remember { mutableStateOf<BackupData?>(null) }
+    var screenMenuExpanded by rememberSaveable { mutableStateOf(false) }
 
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
@@ -605,7 +760,24 @@ private fun FinanceTrackerScreen(
         }
     }
 
-    val activeSection = AppSection.valueOf(currentSection)
+    val folderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                appContext.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+                onAutoBackupTreeUriChange(uri.toString())
+            }.onSuccess {
+                feedbackMessage = "Automatic backup folder saved."
+            }.onFailure {
+                feedbackMessage = it.message ?: "Unable to save the backup folder."
+            }
+        }
+    }
+
     val availableSections = remember(hintsEnabled) {
         if (hintsEnabled) {
             AppSection.entries
@@ -613,10 +785,15 @@ private fun FinanceTrackerScreen(
             AppSection.entries.filterNot { it == AppSection.HINTS }
         }
     }
+    val swipeSections = availableSections
+    val swipePagerState = rememberPagerState(
+        initialPage = 0,
+        pageCount = { swipeSections.size }
+    )
+    val activeSection = swipeSections.getOrElse(swipePagerState.currentPage) { swipeSections.first() }
     val availableYears = (entries.map { millisToYear(it.dateMillis) } + currentYear)
         .distinct()
         .sortedDescending()
-
     LaunchedEffect(categories.size, categories.joinToString("|")) {
         if (categories.isNotEmpty() && (selectedCategory.isBlank() || selectedCategory !in categories)) {
             selectedCategory = categories.first()
@@ -632,19 +809,23 @@ private fun FinanceTrackerScreen(
         }
     }
 
-    LaunchedEffect(hintsEnabled, currentSection) {
-        if (!hintsEnabled && currentSection == AppSection.HINTS.name) {
-            currentSection = AppSection.HOME.name
+    LaunchedEffect(hintsEnabled, activeSection) {
+        if (!hintsEnabled && activeSection == AppSection.HINTS) {
+            swipePagerState.scrollToPage(swipeSections.indexOf(AppSection.HOME))
         }
     }
 
-    val selectedYearEntries = entries.filter { millisToYear(it.dateMillis) == selectedYear }
+    val matchesSelectedCategory: (FinanceEntry) -> Boolean = {
+        selectedFilterCategory == "All Categories" || it.category == selectedFilterCategory
+    }
+
+    val selectedYearEntries = entries
+        .filter { millisToYear(it.dateMillis) == selectedYear }
+        .filter(matchesSelectedCategory)
     val filteredEntries = entries
         .filter { millisToYear(it.dateMillis) == selectedYear }
         .filter { selectedMonth == allYearMonth || millisToMonth(it.dateMillis) == selectedMonth }
-        .filter {
-            selectedFilterCategory == "All Categories" || it.category == selectedFilterCategory
-        }
+        .filter(matchesSelectedCategory)
         .sortedByDescending { it.dateMillis }
 
     val sortedEntries = entries.sortedByDescending { it.dateMillis }
@@ -685,7 +866,7 @@ private fun FinanceTrackerScreen(
     val monthlyChartData = (0..11).map { month ->
         val monthEntries = entries.filter {
             millisToYear(it.dateMillis) == selectedYear && millisToMonth(it.dateMillis) == month
-        }
+        }.filter(matchesSelectedCategory)
         MonthlyTotals(
             label = (month + 1).toString(),
             incomeCents = monthEntries.filter { it.type == TransactionType.INCOME }.sumOf { it.amountCents },
@@ -694,7 +875,9 @@ private fun FinanceTrackerScreen(
     }
 
     val yearlyChartData = availableYears.sorted().map { year ->
-        val yearEntries = entries.filter { millisToYear(it.dateMillis) == year }
+        val yearEntries = entries
+            .filter { millisToYear(it.dateMillis) == year }
+            .filter(matchesSelectedCategory)
         YearlyTotals(
             label = year.toString(),
             incomeCents = yearEntries.filter { it.type == TransactionType.INCOME }.sumOf { it.amountCents },
@@ -710,100 +893,52 @@ private fun FinanceTrackerScreen(
             }
         }
         .toList()
-        .sortedByDescending { (_, total) -> total }
+        .sortedByDescending { (_, total) -> abs(total) }
 
     val editingEntry = entries.firstOrNull { it.id == editingEntryId }
     val pendingDeleteEntry = entries.firstOrNull { it.id == pendingDeleteEntryId }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
-        drawerContent = {
-            ModalDrawerSheet {
-                Column(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "IvE",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Menu",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                availableSections.forEach { section ->
-                    NavigationDrawerItem(
-                        label = { Text(section.title) },
-                        selected = activeSection == section,
-                        onClick = {
-                            currentSection = section.name
-                            scope.launch { drawerState.close() }
-                        },
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        topBar = {
+            TopAppBar(
+                title = {
+                    ScreenPickerTitle(
+                        title = "I>E ${activeSection.title}",
+                        sections = swipeSections,
+                        selectedSection = activeSection,
+                        expanded = screenMenuExpanded,
+                        onExpandedChange = { screenMenuExpanded = it },
+                        onSectionSelected = { section ->
+                            scope.launch {
+                                swipePagerState.animateScrollToPage(swipeSections.indexOf(section))
+                            }
+                        }
                     )
                 }
-            }
+            )
         }
-    ) {
-        Scaffold(
-            modifier = Modifier.fillMaxSize(),
-            topBar = {
-                TopAppBar(
-                    title = {
-                        Column {
-                            Text("IvE ${activeSection.title}")
-                            Text(
-                                text = activeSection.subtitle,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    },
-                    navigationIcon = {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(
-                                imageVector = Icons.Filled.Menu,
-                                contentDescription = "Open menu"
-                            )
-                        }
-                    }
-                )
-            }
-        ) { innerPadding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .then(
-                        if (activeSection == AppSection.STATS) {
-                            Modifier
-                        } else {
-                            Modifier.verticalScroll(rememberScrollState())
-                        }
-                    )
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                feedbackMessage?.let { message ->
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.secondaryContainer
-                    ) {
-                        Text(
-                            text = message,
-                            modifier = Modifier.padding(14.dp),
-                            color = MaterialTheme.colorScheme.onSecondaryContainer
-                        )
-                    }
-                }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            HorizontalPager(
+                state = swipePagerState,
+                modifier = Modifier.fillMaxSize()
+            ) { page ->
+                val section = swipeSections[page]
 
-                when (activeSection) {
-                    AppSection.HOME -> {
-                        HomeSection(
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    when (section) {
+                        AppSection.HOME -> HomeSection(
                             categories = categories,
                             selectedType = selectedType,
                             onSelectedTypeChange = { selectedType = it },
@@ -836,13 +971,13 @@ private fun FinanceTrackerScreen(
                             },
                             appContext = appContext
                         )
-                    }
 
-                    AppSection.CATEGORIES -> {
-                        CategoriesSection(
+                        AppSection.CATEGORIES -> CategoriesSection(
                             categories = categories,
                             newCategoryInput = newCategoryInput,
-                            onNewCategoryInputChange = { newCategoryInput = it },
+                            onNewCategoryInputChange = {
+                                newCategoryInput = it.take(MAX_CATEGORY_NAME_LENGTH)
+                            },
                             onAddCategory = {
                                 feedbackMessage = onAddCategory(newCategoryInput)
                                     ?: "Category added: ${newCategoryInput.trim()}."
@@ -861,10 +996,8 @@ private fun FinanceTrackerScreen(
                                 )
                             }
                         )
-                    }
 
-                    AppSection.STATS -> {
-                        StatsSection(
+                        AppSection.STATS -> StatsSection(
                             categories = categories,
                             availableYears = availableYears,
                             selectedYear = selectedYear,
@@ -884,10 +1017,8 @@ private fun FinanceTrackerScreen(
                             yearlyChartData = yearlyChartData,
                             categoryTotals = categoryTotals
                         )
-                    }
 
-                    AppSection.TRANSACTIONS -> {
-                        TransactionsSection(
+                        AppSection.TRANSACTIONS -> TransactionsSection(
                             transactionSearchQuery = transactionSearchQuery,
                             onTransactionSearchQueryChange = { transactionSearchQuery = it },
                             entries = searchedEntries,
@@ -896,14 +1027,10 @@ private fun FinanceTrackerScreen(
                             onEditEntry = { entry -> editingEntryId = entry.id },
                             onDeleteEntry = { entry -> pendingDeleteEntryId = entry.id }
                         )
-                    }
 
-                    AppSection.HINTS -> {
-                        HintsSection()
-                    }
+                        AppSection.HINTS -> HintsSection()
 
-                    AppSection.SETTINGS -> {
-                        SettingsSection(
+                        AppSection.SETTINGS -> SettingsSection(
                             selectedCurrencyCode = currencyCode,
                             onSelectedCurrencyCodeChange = {
                                 onCurrencyCodeChange(it)
@@ -919,6 +1046,30 @@ private fun FinanceTrackerScreen(
                                 onHintsEnabledChange(it)
                                 feedbackMessage = if (it) "Hints turned on." else "Hints turned off."
                             },
+                            autoBackupEnabled = autoBackupEnabled,
+                            onAutoBackupEnabledChange = { enabled ->
+                                if (enabled && autoBackupTreeUri.isNullOrBlank()) {
+                                    feedbackMessage = "Choose an automatic backup folder first."
+                                } else {
+                                    onAutoBackupEnabledChange(enabled)
+                                    feedbackMessage = if (enabled) {
+                                        "Automatic backup enabled."
+                                    } else {
+                                        "Automatic backup turned off."
+                                    }
+                                }
+                            },
+                            autoBackupMinutes = autoBackupMinutes,
+                            onAutoBackupMinutesChange = { minutes ->
+                                onAutoBackupMinutesChange(minutes)
+                                feedbackMessage = "Automatic backup time updated."
+                            },
+                            autoBackupFolderLabel = autoBackupTreeUri
+                                ?.let(::backupFolderLabelFromUri)
+                                ?: "No backup folder selected.",
+                            onChooseAutoBackupFolder = {
+                                folderLauncher.launch(null)
+                            },
                             onExportBackup = {
                                 exportLauncher.launch("ive-backup-${backupFileDateStamp()}.json")
                             },
@@ -931,7 +1082,6 @@ private fun FinanceTrackerScreen(
             }
         }
     }
-
     editingEntry?.let { entry ->
         EditTransactionDialog(
             categories = categories,
@@ -963,7 +1113,7 @@ private fun FinanceTrackerScreen(
     pendingDeleteEntry?.let { entry ->
         AlertDialog(
             onDismissRequest = { pendingDeleteEntryId = null },
-            title = { Text("Remove Transaction") },
+            title = { TitleWithAppIcon("Remove Transaction") },
             text = {
                 Text("Remove ${formatCurrency(entry.amountCents, currencyCode)} from ${entry.category} on ${formatDate(entry.dateMillis)}?")
             },
@@ -1009,7 +1159,7 @@ private fun FinanceTrackerScreen(
     pendingCategoryDelete?.let { pendingDelete ->
         AlertDialog(
             onDismissRequest = { pendingCategoryDelete = null },
-            title = { Text("Remove Category") },
+            title = { TitleWithAppIcon("Remove Category") },
             text = {
                 Text(
                     "Removing ${pendingDelete.category} will also delete ${pendingDelete.transactionCount} related " +
@@ -1039,7 +1189,7 @@ private fun FinanceTrackerScreen(
     pendingTransaction?.let { draft ->
         AlertDialog(
             onDismissRequest = { pendingTransaction = null },
-            title = { Text("Save Transaction") },
+            title = { TitleWithAppIcon("Save Transaction") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Review this transaction before saving.")
@@ -1080,7 +1230,7 @@ private fun FinanceTrackerScreen(
     pendingImportBackup?.let { backup ->
         AlertDialog(
             onDismissRequest = { pendingImportBackup = null },
-            title = { Text("Import Backup") },
+            title = { TitleWithAppIcon("Import Backup") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Importing a backup will replace your current app data.")
@@ -1133,7 +1283,7 @@ private fun TitleScreen() {
                         append("Income")
                     }
                     withStyle(MaterialTheme.typography.displayMedium.toSpanStyle().copy(color = Color.LightGray)) {
-                        append(" vs ")
+                        append(" > ")
                     }
                     withStyle(MaterialTheme.typography.displayMedium.toSpanStyle().copy(color = negativeColor)) {
                         append("Expense")
@@ -1143,6 +1293,13 @@ private fun TitleScreen() {
                 textAlign = TextAlign.Center
             )
             Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = "It simple, make more than you spend!",
+                style = MaterialTheme.typography.titleMedium,
+                color = Color.White.copy(alpha = 0.9f),
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = "Track what comes in and what goes out.",
                 style = MaterialTheme.typography.titleMedium,
@@ -1156,6 +1313,86 @@ private fun TitleScreen() {
                 color = Color.White.copy(alpha = 0.7f),
                 textAlign = TextAlign.Center
             )
+        }
+    }
+}
+
+@Composable
+private fun TitleWithAppIcon(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: TextStyle = MaterialTheme.typography.titleLarge,
+    fontWeight: FontWeight = FontWeight.SemiBold,
+    iconSize: Dp = 18.dp,
+    spacing: Dp = 8.dp
+) {
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(spacing)
+    ) {
+        Image(
+            painter = painterResource(R.drawable.ic_launcher_foreground),
+            contentDescription = null,
+            modifier = Modifier.size(iconSize)
+        )
+        Text(
+            text = text,
+            style = style,
+            fontWeight = fontWeight
+        )
+    }
+}
+
+@Composable
+private fun ScreenPickerTitle(
+    title: String,
+    sections: List<AppSection>,
+    selectedSection: AppSection,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onSectionSelected: (AppSection) -> Unit
+) {
+    Box {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            IconButton(
+                onClick = { onExpandedChange(true) },
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Menu,
+                    contentDescription = "Choose screen",
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Medium
+            )
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { onExpandedChange(false) }
+        ) {
+            sections.forEach { section ->
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = section.title,
+                            fontWeight = if (section == selectedSection) FontWeight.SemiBold else FontWeight.Normal
+                        )
+                    },
+                    onClick = {
+                        onExpandedChange(false)
+                        onSectionSelected(section)
+                    }
+                )
+            }
         }
     }
 }
@@ -1198,10 +1435,9 @@ private fun HomeSection(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                text = "$currentYear Income vs Expense",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+            TitleWithAppIcon(
+                text = "$currentYear Income > Expense",
+                style = MaterialTheme.typography.titleLarge
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1227,26 +1463,25 @@ private fun HintsSection() {
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                text = "How to Use IvE",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+            TitleWithAppIcon(
+                text = "How to Use I>E",
+                style = MaterialTheme.typography.titleLarge
             )
             Text(
-                text = "IvE is meant to stay simple. The goal is to record money coming in and money going out, then use the summaries to help keep income higher than expenses.",
+                text = "I>E is meant to stay simple. The goal is to record money coming in and money going out, then use the summaries to help keep income higher than expenses.",
                 style = MaterialTheme.typography.bodyLarge
             )
             HintCard(
                 title = "Start on Home",
-                message = "Use Home to enter a new transaction quickly. Pick Income or Expense, choose the date and category, then type only numbers for the amount. IvE places the decimal automatically for the selected currency."
+                message = "Use Home to enter a new transaction quickly. Pick Income or Expense, choose the date and category, then type only numbers for the amount. I>E places the decimal automatically for the selected currency."
             )
             HintCard(
                 title = "Save Carefully",
-                message = "After entering a transaction, IvE shows a confirmation dialog with the details. Review the type, date, category, and amount, then choose Save or Cancel."
+                message = "After entering a transaction, I>E shows a confirmation dialog with the details. Review the type, date, category, and amount, then choose Save or Cancel."
             )
             HintCard(
                 title = "Manage Categories",
-                message = "Use Categories to add, rename, or remove category names. If you rename a category, related transactions are updated. If you remove one, IvE warns you that matching transactions will also be deleted."
+                message = "Use Categories to add, rename, or remove category names. If you rename a category, related transactions are updated. If you remove one, I>E warns you that matching transactions will also be deleted."
             )
             HintCard(
                 title = "Read the Stats",
@@ -1254,7 +1489,7 @@ private fun HintsSection() {
             )
             HintCard(
                 title = "Review Transactions",
-                message = "Use Transactions to search your full history, edit older entries, or remove them. When you are not searching, IvE shows the 10 most recent transactions to keep the screen clean."
+                message = "Use Transactions to search your full history, edit older entries, or remove them. When you are not searching, I>E shows the 10 most recent transactions to keep the screen clean."
             )
             HintCard(
                 title = "Settings and Backups",
@@ -1314,17 +1549,16 @@ private fun CategoriesSection(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
+            TitleWithAppIcon(
                 text = "Categories (${categories.size}/30)",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
 
             OutlinedTextField(
                 value = newCategoryInput,
                 onValueChange = onNewCategoryInputChange,
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("New Category") },
+                label = { Text("New Category (Max $MAX_CATEGORY_NAME_LENGTH Chars)") },
                 singleLine = true
             )
 
@@ -1341,17 +1575,29 @@ private fun CategoriesSection(
             } else {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     categories.forEach { category ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
                         ) {
-                            Text(category, modifier = Modifier.weight(1f))
-                            TextButton(onClick = { onEditCategory(category) }) {
-                                Text("Edit")
-                            }
-                            TextButton(onClick = { onRemoveCategory(category) }) {
-                                Text("Remove")
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = category,
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                OutlinedButton(onClick = { onEditCategory(category) }) {
+                                    Text("Edit Name")
+                                }
+                                TextButton(onClick = { onRemoveCategory(category) }) {
+                                    Text("Remove")
+                                }
                             }
                         }
                     }
@@ -1385,11 +1631,9 @@ private fun StatsSection(
     var filterCategoryMenuExpanded by remember { mutableStateOf(false) }
     var yearMenuExpanded by remember { mutableStateOf(false) }
     var monthMenuExpanded by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
     var monthlyDisplayMode by rememberSaveable { mutableStateOf(StatsDisplayMode.GRAPH.name) }
     var yearlyDisplayMode by rememberSaveable { mutableStateOf(StatsDisplayMode.GRAPH.name) }
     var categoryDisplayMode by rememberSaveable { mutableStateOf(StatsDisplayMode.GRAPH.name) }
-    val pagerState = rememberPagerState(pageCount = { 4 })
     val selectedMonthlyDisplayMode = StatsDisplayMode.valueOf(monthlyDisplayMode)
     val selectedYearlyDisplayMode = StatsDisplayMode.valueOf(yearlyDisplayMode)
     val selectedCategoryDisplayMode = StatsDisplayMode.valueOf(categoryDisplayMode)
@@ -1399,255 +1643,192 @@ private fun StatsSection(
     } else {
         "Category Totals (${monthName(selectedMonth)})"
     }
-    val statPageCount = 4
+    Card {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            TitleWithAppIcon(
+                text = "Filters and Summary",
+                style = MaterialTheme.typography.titleLarge
+            )
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center
-    ) {
-        repeat(statPageCount) { index ->
-            val indicatorColor = if (pagerState.currentPage == index) {
-                neutralColor
-            } else {
-                MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
-            }
-            TextButton(
-                onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
-                modifier = Modifier.size(28.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Canvas(modifier = Modifier.size(10.dp)) {
-                    drawRoundRect(
-                        color = indicatorColor,
-                        cornerRadius = CornerRadius(99f, 99f)
-                    )
+                DropdownSelector(
+                    label = "Year",
+                    values = availableYears.map { it.toString() },
+                    selectedValue = selectedYear.toString(),
+                    expanded = yearMenuExpanded,
+                    onExpandedChange = { yearMenuExpanded = it },
+                    onValueSelected = {
+                        onSelectedYearChange(it.toInt())
+                        yearMenuExpanded = false
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+
+                DropdownSelector(
+                    label = "Month",
+                    values = listOf(allYearLabel) + (0..11).map(::monthName),
+                    selectedValue = monthSelectionLabel(selectedMonth),
+                    expanded = monthMenuExpanded,
+                    onExpandedChange = { monthMenuExpanded = it },
+                    onValueSelected = { picked ->
+                        onSelectedMonthChange(monthIndexFromNameOrAllYear(picked))
+                        monthMenuExpanded = false
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Box {
+                OutlinedButton(
+                    onClick = { filterCategoryMenuExpanded = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(selectedFilterCategory)
                 }
+                DropdownMenu(
+                    expanded = filterCategoryMenuExpanded,
+                    onDismissRequest = { filterCategoryMenuExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("All Categories") },
+                        onClick = {
+                            onSelectedFilterCategoryChange("All Categories")
+                            filterCategoryMenuExpanded = false
+                        }
+                    )
+                    categories.forEach { category ->
+                        DropdownMenuItem(
+                            text = { Text(category) },
+                            onClick = {
+                                onSelectedFilterCategoryChange(category)
+                                filterCategoryMenuExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                SummaryTile("$periodLabel Income", formatCurrency(monthIncome, currencyCode), positiveColor, Modifier.weight(1f))
+                SummaryTile("$periodLabel Expense", formatCurrency(monthExpense, currencyCode), negativeColor, Modifier.weight(1f))
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                SummaryTile("$periodLabel Net", formatSignedCurrency(monthNet, currencyCode), neutralColor, Modifier.weight(1f))
+                SummaryTile("Year Net", formatSignedCurrency(yearNet, currencyCode), neutralColor, Modifier.weight(1f))
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                SummaryTile("Year Income", formatCurrency(yearIncome, currencyCode), positiveColor, Modifier.weight(1f))
+                SummaryTile("Year Expense", formatCurrency(yearExpense, currencyCode), negativeColor, Modifier.weight(1f))
             }
         }
     }
 
-    HorizontalPager(
-        state = pagerState,
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(520.dp)
-    ) { page ->
-        when (page) {
-            0 -> {
-                Card {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "Filters and Summary",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            DropdownSelector(
-                                label = "Year",
-                                values = availableYears.map { it.toString() },
-                                selectedValue = selectedYear.toString(),
-                                expanded = yearMenuExpanded,
-                                onExpandedChange = { yearMenuExpanded = it },
-                                onValueSelected = {
-                                    onSelectedYearChange(it.toInt())
-                                    yearMenuExpanded = false
-                                },
-                                modifier = Modifier.weight(1f)
-                            )
-
-                            DropdownSelector(
-                                label = "Month",
-                                values = listOf(allYearLabel) + (0..11).map(::monthName),
-                                selectedValue = monthSelectionLabel(selectedMonth),
-                                expanded = monthMenuExpanded,
-                                onExpandedChange = { monthMenuExpanded = it },
-                                onValueSelected = { picked ->
-                                    onSelectedMonthChange(monthIndexFromNameOrAllYear(picked))
-                                    monthMenuExpanded = false
-                                },
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-
-                        Box {
-                            OutlinedButton(
-                                onClick = { filterCategoryMenuExpanded = true },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(selectedFilterCategory)
-                            }
-                            DropdownMenu(
-                                expanded = filterCategoryMenuExpanded,
-                                onDismissRequest = { filterCategoryMenuExpanded = false }
-                            ) {
-                                DropdownMenuItem(
-                                    text = { Text("All Categories") },
-                                    onClick = {
-                                        onSelectedFilterCategoryChange("All Categories")
-                                        filterCategoryMenuExpanded = false
-                                    }
-                                )
-                                categories.forEach { category ->
-                                    DropdownMenuItem(
-                                        text = { Text(category) },
-                                        onClick = {
-                                            onSelectedFilterCategoryChange(category)
-                                            filterCategoryMenuExpanded = false
-                                        }
-                                    )
-                                }
-                            }
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            SummaryTile("$periodLabel Income", formatCurrency(monthIncome, currencyCode), positiveColor, Modifier.weight(1f))
-                            SummaryTile("$periodLabel Expense", formatCurrency(monthExpense, currencyCode), negativeColor, Modifier.weight(1f))
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            SummaryTile("$periodLabel Net", formatSignedCurrency(monthNet, currencyCode), neutralColor, Modifier.weight(1f))
-                            SummaryTile("Year Net", formatSignedCurrency(yearNet, currencyCode), neutralColor, Modifier.weight(1f))
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            SummaryTile("Year Income", formatCurrency(yearIncome, currencyCode), positiveColor, Modifier.weight(1f))
-                            SummaryTile("Year Expense", formatCurrency(yearExpense, currencyCode), negativeColor, Modifier.weight(1f))
-                        }
+    Card {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            TitleWithAppIcon(
+                text = "Monthly Chart ($selectedYear)",
+                style = MaterialTheme.typography.titleLarge
+            )
+            StatsDisplayModeSelector(
+                selectedMode = selectedMonthlyDisplayMode,
+                onModeSelected = { monthlyDisplayMode = it.name }
+            )
+            if (selectedMonthlyDisplayMode == StatsDisplayMode.GRAPH) {
+                DualBarChart(
+                    monthlyData = monthlyChartData.map {
+                        ChartBarGroup(it.label, it.incomeCents, it.expenseCents)
                     }
-                }
+                )
+            } else {
+                MonthlyStatsValueList(
+                    items = monthlyChartData.map {
+                        Triple(
+                            monthName(it.label.toInt() - 1),
+                            formatCurrency(it.expenseCents, currencyCode),
+                            formatCurrency(it.incomeCents, currencyCode)
+                        )
+                    }
+                )
             }
+        }
+    }
 
-            1 -> {
-                Card(modifier = Modifier.fillMaxSize()) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "Monthly Chart ($selectedYear)",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        StatsDisplayModeSelector(
-                            selectedMode = selectedMonthlyDisplayMode,
-                            onModeSelected = { monthlyDisplayMode = it.name }
-                        )
-                        if (selectedMonthlyDisplayMode == StatsDisplayMode.GRAPH) {
-                            DualBarChart(
-                                monthlyData = monthlyChartData.map {
-                                    ChartBarGroup(it.label, it.incomeCents, it.expenseCents)
-                                }
-                            )
-                        } else {
-                            StatsValueList(
-                                modifier = Modifier.weight(1f),
-                                items = monthlyChartData.map {
-                                    Triple(
-                                        it.label,
-                                        formatCurrency(it.incomeCents, currencyCode),
-                                        formatCurrency(it.expenseCents, currencyCode)
-                                    )
-                                },
-                                startLabel = "Income",
-                                endLabel = "Expense"
-                            )
-                        }
+    Card {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            TitleWithAppIcon(
+                text = "Yearly Chart",
+                style = MaterialTheme.typography.titleLarge
+            )
+            StatsDisplayModeSelector(
+                selectedMode = selectedYearlyDisplayMode,
+                onModeSelected = { yearlyDisplayMode = it.name }
+            )
+            if (selectedYearlyDisplayMode == StatsDisplayMode.GRAPH) {
+                DualBarChart(
+                    monthlyData = yearlyChartData.map {
+                        ChartBarGroup(it.label, it.incomeCents, it.expenseCents)
                     }
-                }
+                )
+            } else {
+                MonthlyStatsValueList(
+                    items = yearlyChartData.map {
+                        Triple(
+                            it.label,
+                            formatCurrency(it.expenseCents, currencyCode),
+                            formatCurrency(it.incomeCents, currencyCode)
+                        )
+                    }
+                )
             }
+        }
+    }
 
-            2 -> {
-                Card {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = "Yearly Chart",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        StatsDisplayModeSelector(
-                            selectedMode = selectedYearlyDisplayMode,
-                            onModeSelected = { yearlyDisplayMode = it.name }
-                        )
-                        if (selectedYearlyDisplayMode == StatsDisplayMode.GRAPH) {
-                            DualBarChart(
-                                monthlyData = yearlyChartData.map {
-                                    ChartBarGroup(it.label, it.incomeCents, it.expenseCents)
-                                }
-                            )
-                        } else {
-                            StatsValueList(
-                                items = yearlyChartData.map {
-                                    Triple(
-                                        it.label,
-                                        formatCurrency(it.incomeCents, currencyCode),
-                                        formatCurrency(it.expenseCents, currencyCode)
-                                    )
-                                },
-                                startLabel = "Income",
-                                endLabel = "Expense"
-                            )
-                        }
-                    }
-                }
-            }
-
-            else -> {
-                Card {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = categoryTotalsLabel,
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        StatsDisplayModeSelector(
-                            selectedMode = selectedCategoryDisplayMode,
-                            onModeSelected = { categoryDisplayMode = it.name }
-                        )
-                        if (categoryTotals.isEmpty()) {
-                            Text(if (selectedMonth == allYearMonth) "No transactions found for the selected year." else "No transactions found for the selected month.")
-                        } else if (selectedCategoryDisplayMode == StatsDisplayMode.GRAPH) {
-                            CategoryTotalsBarChart(
-                                categoryTotals = categoryTotals,
-                                currencyCode = currencyCode
-                            )
-                        } else {
-                            categoryTotals.forEach { (category, total) ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(category)
-                                    Text(
-                                        text = formatSignedCurrency(total, currencyCode),
-                                        color = if (total >= 0) positiveColor else negativeColor,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
+    Card {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            TitleWithAppIcon(
+                text = categoryTotalsLabel,
+                style = MaterialTheme.typography.titleLarge
+            )
+            StatsDisplayModeSelector(
+                selectedMode = selectedCategoryDisplayMode,
+                onModeSelected = { categoryDisplayMode = it.name }
+            )
+            if (categoryTotals.isEmpty()) {
+                Text(if (selectedMonth == allYearMonth) "No transactions found for the selected year." else "No transactions found for the selected month.")
+            } else if (selectedCategoryDisplayMode == StatsDisplayMode.GRAPH) {
+                CategoryTotalsBarChart(
+                    categoryTotals = categoryTotals,
+                    currencyCode = currencyCode
+                )
+            } else {
+                CategoryTotalsValueList(
+                    categoryTotals = categoryTotals,
+                    currencyCode = currencyCode
+                )
             }
         }
     }
@@ -1668,10 +1849,9 @@ private fun TransactionsSection(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
+            TitleWithAppIcon(
                 text = if (isShowingSearchResults) "Search Results" else "Recent Transactions",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
 
             OutlinedTextField(
@@ -1727,7 +1907,7 @@ private fun EditTransactionDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Edit Transaction") },
+        title = { TitleWithAppIcon("Edit Transaction") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 TransactionTypeSelector(
@@ -1824,13 +2004,13 @@ private fun EditCategoryDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Edit Category") },
+        title = { TitleWithAppIcon("Edit Category") },
         text = {
             OutlinedTextField(
                 value = categoryName,
-                onValueChange = { categoryName = it },
+                onValueChange = { categoryName = it.take(MAX_CATEGORY_NAME_LENGTH) },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Category name") },
+                label = { Text("Category name (max $MAX_CATEGORY_NAME_LENGTH)") },
                 singleLine = true
             )
         },
@@ -1855,9 +2035,16 @@ private fun SettingsSection(
     onSelectedThemeModeChange: (ThemeMode) -> Unit,
     hintsEnabled: Boolean,
     onHintsEnabledChange: (Boolean) -> Unit,
+    autoBackupEnabled: Boolean,
+    onAutoBackupEnabledChange: (Boolean) -> Unit,
+    autoBackupMinutes: Int,
+    onAutoBackupMinutesChange: (Int) -> Unit,
+    autoBackupFolderLabel: String,
+    onChooseAutoBackupFolder: () -> Unit,
     onExportBackup: () -> Unit,
     onImportBackup: () -> Unit
 ) {
+    val context = LocalContext.current
     var currencyMenuExpanded by remember { mutableStateOf(false) }
     var themeMenuExpanded by remember { mutableStateOf(false) }
     val selectedCurrency = commonCurrencies.firstOrNull { it.code == selectedCurrencyCode }
@@ -1868,10 +2055,9 @@ private fun SettingsSection(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
+            TitleWithAppIcon(
                 text = "Currency",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
             Text(
                 text = "Choose the currency used for summaries, charts, and transaction amounts.",
@@ -1903,10 +2089,9 @@ private fun SettingsSection(
                 }
             }
 
-            Text(
+            TitleWithAppIcon(
                 text = "Background",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
             Text(
                 text = "Choose whether the app uses a light background, dark background, or the system setting.",
@@ -1936,46 +2121,67 @@ private fun SettingsSection(
                 }
             }
 
-            Text(
-                text = "Hints",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                text = if (hintsEnabled) {
-                    "Hints are available from the Hints page in the menu."
-                } else {
-                    "Hints are turned off and hidden from the menu."
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            if (hintsEnabled) {
-                OutlinedButton(
-                    onClick = { onHintsEnabledChange(false) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Turn Off Hints")
-                }
-            } else {
-                Button(
-                    onClick = { onHintsEnabledChange(true) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Turn On Hints")
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
+            TitleWithAppIcon(
                 text = "Backup",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
             Text(
                 text = "Export your data to a file or import a previous backup.",
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "Automatic Backup",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        text = "Create one backup file every day at ${formatTimeOfDay(autoBackupMinutes)}.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = autoBackupEnabled,
+                    onCheckedChange = onAutoBackupEnabledChange
+                )
+            }
+            OutlinedButton(
+                onClick = {
+                    val hour = autoBackupMinutes / 60
+                    val minute = autoBackupMinutes % 60
+                    TimePickerDialog(
+                        context,
+                        { _, pickedHour, pickedMinute ->
+                            onAutoBackupMinutesChange((pickedHour * 60) + pickedMinute)
+                        },
+                        hour,
+                        minute,
+                        false
+                    ).show()
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Auto Backup Time: ${formatTimeOfDay(autoBackupMinutes)}")
+            }
+            OutlinedButton(
+                onClick = onChooseAutoBackupFolder,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Choose Auto Backup Folder")
+            }
+            Text(
+                text = autoBackupFolderLabel,
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Button(
@@ -1993,13 +2199,12 @@ private fun SettingsSection(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Text(
+            TitleWithAppIcon(
                 text = "About",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
             Text(
-                text = "How to Use IvE",
+                text = "How to Use I>E",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Medium
             )
@@ -2167,10 +2372,12 @@ private fun StatsValueList(
     modifier: Modifier = Modifier,
     items: List<Triple<String, String, String>>,
     startLabel: String,
-    endLabel: String
+    endLabel: String,
+    startValueColor: Color = MaterialTheme.colorScheme.onSurface,
+    endValueColor: Color = MaterialTheme.colorScheme.onSurface
 ) {
     Column(
-        modifier = modifier.verticalScroll(rememberScrollState()),
+        modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         items.forEach { (label, startValue, endValue) ->
@@ -2184,9 +2391,75 @@ private fun StatsValueList(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("$startLabel: $startValue")
-                        Text("$endLabel: $endValue")
+                        Text(
+                            text = "$startLabel: $startValue",
+                            color = startValueColor
+                        )
+                        Text(
+                            text = "$endLabel: $endValue",
+                            color = endValueColor
+                        )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MonthlyStatsValueList(
+    modifier: Modifier = Modifier,
+    items: List<Triple<String, String, String>>
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        items.forEach { (label, expenseValue, incomeValue) ->
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(label, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = "Expense: $expenseValue",
+                        color = negativeColor
+                    )
+                    Text(
+                        text = "Income: $incomeValue",
+                        color = positiveColor
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryTotalsValueList(
+    modifier: Modifier = Modifier,
+    categoryTotals: List<Pair<String, Long>>,
+    currencyCode: String
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        categoryTotals.forEach { (category, total) ->
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(category, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = formatSignedCurrency(total, currencyCode),
+                        color = if (total >= 0) positiveColor else negativeColor,
+                        fontWeight = FontWeight.Medium
+                    )
                 }
             }
         }
@@ -2351,10 +2624,9 @@ private fun AddTransactionCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
+            TitleWithAppIcon(
                 text = "Add Transaction",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
+                style = MaterialTheme.typography.titleLarge
             )
 
             TransactionTypeSelector(
@@ -2362,24 +2634,29 @@ private fun AddTransactionCard(
                 onSelectedTypeChange = onSelectedTypeChange
             )
 
-            OutlinedButton(
-                onClick = {
-                    showDatePicker(
-                        pickerContext = appContext,
-                        initialMillis = selectedDateMillis,
-                        onDatePicked = onSelectedDateMillisChange
-                    )
-                }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text("Date: ${formatDate(selectedDateMillis)}")
-            }
-
-            Box {
                 OutlinedButton(
-                    onClick = { categoryMenuExpanded = true },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = categories.isNotEmpty()
+                    onClick = {
+                        showDatePicker(
+                            pickerContext = appContext,
+                            initialMillis = selectedDateMillis,
+                            onDatePicked = onSelectedDateMillisChange
+                        )
+                    },
+                    modifier = Modifier.weight(1f)
                 ) {
+                    Text("Date: ${formatDate(selectedDateMillis)}")
+                }
+
+                Box(modifier = Modifier.weight(1f)) {
+                    OutlinedButton(
+                        onClick = { categoryMenuExpanded = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = categories.isNotEmpty()
+                    ) {
                         Text(
                             text = if (selectedCategory.isBlank()) {
                                 "Select Category"
@@ -2387,20 +2664,21 @@ private fun AddTransactionCard(
                                 "Category: $selectedCategory"
                             }
                         )
-                }
-                DropdownMenu(
-                    expanded = categoryMenuExpanded,
-                    onDismissRequest = { categoryMenuExpanded = false },
-                    modifier = Modifier.heightIn(max = 320.dp)
-                ) {
-                    categories.forEach { category ->
-                        DropdownMenuItem(
-                            text = { Text(category) },
-                            onClick = {
-                                onSelectedCategoryChange(category)
-                                categoryMenuExpanded = false
-                            }
-                        )
+                    }
+                    DropdownMenu(
+                        expanded = categoryMenuExpanded,
+                        onDismissRequest = { categoryMenuExpanded = false },
+                        modifier = Modifier.heightIn(max = 320.dp)
+                    ) {
+                        categories.forEach { category ->
+                            DropdownMenuItem(
+                                text = { Text(category) },
+                                onClick = {
+                                    onSelectedCategoryChange(category)
+                                    categoryMenuExpanded = false
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -2509,25 +2787,25 @@ private fun normalizeAmountInput(value: String, currencyCode: String): String {
 
     val fractionDigits = currencyFractionDigits(currencyCode)
     if (fractionDigits == 0) {
-        return digits.trimStart('0').ifEmpty { "0" }
+        return formatGroupedWholeNumber(digits.trimStart('0').ifEmpty { "0" })
     }
 
     val padded = digits.padStart(fractionDigits + 1, '0')
     val wholePart = padded.dropLast(fractionDigits).trimStart('0').ifEmpty { "0" }
     val decimalPart = padded.takeLast(fractionDigits)
-    return "$wholePart.$decimalPart"
+    return "${formatGroupedWholeNumber(wholePart)}.$decimalPart"
 }
 
 private fun formatMinorUnitsForInput(amountMinorUnits: Long, currencyCode: String): String {
     val fractionDigits = currencyFractionDigits(currencyCode)
     if (fractionDigits == 0) {
-        return amountMinorUnits.toString()
+        return formatGroupedWholeNumber(amountMinorUnits.toString())
     }
 
     val digits = amountMinorUnits.toString().padStart(fractionDigits + 1, '0')
     val wholePart = digits.dropLast(fractionDigits).trimStart('0').ifEmpty { "0" }
     val decimalPart = digits.takeLast(fractionDigits)
-    return "$wholePart.$decimalPart"
+    return "${formatGroupedWholeNumber(wholePart)}.$decimalPart"
 }
 
 private fun defaultAmountPlaceholder(currencyCode: String): String {
@@ -2536,6 +2814,16 @@ private fun defaultAmountPlaceholder(currencyCode: String): String {
         append("0.")
         repeat(fractionDigits) { append('0') }
     }
+}
+
+private fun formatGroupedWholeNumber(value: String): String {
+    val digitsOnly = value.filter(Char::isDigit)
+    if (digitsOnly.isEmpty()) return "0"
+    return digitsOnly
+        .reversed()
+        .chunked(3)
+        .joinToString(",")
+        .reversed()
 }
 
 private fun formatDate(dateMillis: Long): String {
@@ -2593,13 +2881,43 @@ private fun backupFileDateStamp(): String {
     return SimpleDateFormat("yyyyMMdd", Locale.US).format(System.currentTimeMillis())
 }
 
-private fun createdByLabel(): String {
-    val currentYear = Calendar.getInstance().get(Calendar.YEAR)
-    return if (currentYear > 2026) {
-        "Created by tazrog (c)2026-$currentYear"
-    } else {
-        "Created by tazrog (c)2026"
+private fun backupFileTimestamp(): String {
+    return SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(System.currentTimeMillis())
+}
+
+private fun nextAutoBackupTriggerAt(minutesAfterMidnight: Int): Long {
+    val now = Calendar.getInstance()
+    val next = Calendar.getInstance().apply {
+        set(Calendar.HOUR_OF_DAY, minutesAfterMidnight / 60)
+        set(Calendar.MINUTE, minutesAfterMidnight % 60)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        if (!after(now)) {
+            add(Calendar.DAY_OF_YEAR, 1)
+        }
     }
+    return next.timeInMillis
+}
+
+private fun formatTimeOfDay(minutesAfterMidnight: Int): String {
+    val hour = (minutesAfterMidnight / 60).coerceIn(0, 23)
+    val minute = (minutesAfterMidnight % 60).coerceIn(0, 59)
+    val calendar = Calendar.getInstance().apply {
+        set(Calendar.HOUR_OF_DAY, hour)
+        set(Calendar.MINUTE, minute)
+    }
+    return SimpleDateFormat("h:mm a", Locale.getDefault()).format(calendar.time)
+}
+
+private fun backupFolderLabelFromUri(uriString: String): String {
+    return runCatching {
+        val treeUri = Uri.parse(uriString)
+        DocumentsContract.getTreeDocumentId(treeUri).substringAfterLast(':')
+    }.getOrElse { "Selected backup folder." }
+}
+
+private fun createdByLabel(): String {
+    return "Created by tazrog © 2026."
 }
 
 private fun millisToYear(dateMillis: Long): Int {
@@ -2675,6 +2993,12 @@ private fun FinanceTrackerPreview() {
             onThemeModeChange = {},
             hintsEnabled = true,
             onHintsEnabledChange = {},
+            autoBackupEnabled = false,
+            onAutoBackupEnabledChange = {},
+            autoBackupMinutes = 120,
+            onAutoBackupMinutesChange = {},
+            autoBackupTreeUri = null,
+            onAutoBackupTreeUriChange = {},
             onAddEntry = {},
             onUpdateEntry = {},
             onDeleteEntry = {},
