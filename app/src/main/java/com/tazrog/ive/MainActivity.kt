@@ -59,6 +59,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -110,8 +112,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val skipTitleScreen = intent?.getBooleanExtra(EXTRA_SKIP_TITLE_SCREEN, false) == true
+        val initialSectionName = intent?.getStringExtra(EXTRA_INITIAL_SECTION)
         setContent {
-            FinanceTrackerApp()
+            FinanceTrackerApp(
+                skipTitleScreen = skipTitleScreen,
+                initialSection = initialSectionName
+                    ?.let { name -> AppSection.entries.firstOrNull { it.name == name } }
+                    ?: AppSection.HOME
+            )
         }
     }
 }
@@ -147,8 +156,8 @@ private enum class AppSection(val title: String, val subtitle: String) {
     CATEGORIES("Categories", "Manage the categories available for your transactions."),
     STATS("Stats", "View summaries and charts by month, year, and category."),
     TRANSACTIONS("Transactions", "Search, edit, and remove saved transactions."),
-    HINTS("Hints", "Read simple guidance for using I>E."),
-    SETTINGS("Settings", "Choose your currency, theme, backups, and hints.")
+    SETTINGS("Settings", "Choose your currency, theme, backups, and about visibility."),
+    HINTS("About", "Read how I>E works, including recurring transactions and backups.")
 }
 
 private data class FinanceEntry(
@@ -156,7 +165,8 @@ private data class FinanceEntry(
     val type: TransactionType,
     val dateMillis: Long,
     val category: String,
-    val amountCents: Long
+    val amountCents: Long,
+    val sourceRecurringId: String? = null
 )
 
 private data class MonthlyTotals(
@@ -175,19 +185,38 @@ private data class TransactionDraft(
     val type: TransactionType,
     val dateMillis: Long,
     val category: String,
-    val amountInput: String
+    val amountInput: String,
+    val recurringFrequency: RecurrenceFrequency = RecurrenceFrequency.MONTHLY
 )
 
 private data class PendingTransaction(
     val type: TransactionType,
     val dateMillis: Long,
     val category: String,
-    val amountCents: Long
+    val amountCents: Long,
+    val recurringFrequency: RecurrenceFrequency? = null
 )
 
 private data class PendingCategoryDelete(
     val category: String,
     val transactionCount: Int
+)
+
+private data class RecurringTransactionDraft(
+    val type: TransactionType,
+    val dateMillis: Long,
+    val category: String,
+    val amountInput: String,
+    val recurringFrequency: RecurrenceFrequency
+)
+
+private data class RecurringTransaction(
+    val id: String,
+    val type: TransactionType,
+    val nextOccurrenceMillis: Long,
+    val category: String,
+    val amountCents: Long,
+    val frequency: RecurrenceFrequency
 )
 
 private data class ChartBarGroup(
@@ -204,6 +233,7 @@ private data class CurrencyOption(
 private data class BackupData(
     val categories: List<String>,
     val entries: List<FinanceEntry>,
+    val recurringTransactions: List<RecurringTransaction>,
     val currencyCode: String,
     val themeMode: ThemeMode,
     val hintsEnabled: Boolean
@@ -223,10 +253,18 @@ private enum class StatsDisplayMode(val label: String) {
     VALUES("Values")
 }
 
+private enum class RecurrenceFrequency(val label: String) {
+    DAILY("Daily"),
+    WEEKLY("Weekly"),
+    MONTHLY("Monthly"),
+    YEARLY("Yearly")
+}
+
 private object FinanceStorage {
     private const val PREFS_NAME = "finance_tracker"
     private const val KEY_CATEGORIES = "categories"
     private const val KEY_ENTRIES = "entries"
+    private const val KEY_RECURRING_TRANSACTIONS = "recurring_transactions"
     private const val KEY_CURRENCY = "currency"
     private const val KEY_THEME_MODE = "theme_mode"
     private const val KEY_HINTS_ENABLED = "hints_enabled"
@@ -272,7 +310,8 @@ private object FinanceStorage {
                         type = TransactionType.valueOf(item.getString("type")),
                         dateMillis = item.getLong("dateMillis"),
                         category = item.getString("category"),
-                        amountCents = item.getLong("amountCents")
+                        amountCents = item.getLong("amountCents"),
+                        sourceRecurringId = item.optString("sourceRecurringId").ifBlank { null }
                     )
                 )
             }
@@ -289,10 +328,88 @@ private object FinanceStorage {
                     put("dateMillis", entry.dateMillis)
                     put("category", entry.category)
                     put("amountCents", entry.amountCents)
+                    entry.sourceRecurringId?.let { put("sourceRecurringId", it) }
                 }
             )
         }
         prefs(context).edit().putString(KEY_ENTRIES, array.toString()).apply()
+        YearIncomeExpenseWidgetUpdater.updateAll(context)
+    }
+
+    fun loadRecurringTransactions(context: Context): List<RecurringTransaction> {
+        val saved = prefs(context).getString(KEY_RECURRING_TRANSACTIONS, null) ?: return emptyList()
+        val array = JSONArray(saved)
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.getJSONObject(index)
+                add(
+                    RecurringTransaction(
+                        id = item.getString("id"),
+                        type = TransactionType.valueOf(item.getString("type")),
+                        nextOccurrenceMillis = item.getLong("nextOccurrenceMillis"),
+                        category = item.getString("category"),
+                        amountCents = item.getLong("amountCents"),
+                        frequency = RecurrenceFrequency.valueOf(item.getString("frequency"))
+                    )
+                )
+            }
+        }
+    }
+
+    fun saveRecurringTransactions(context: Context, recurringTransactions: List<RecurringTransaction>) {
+        val array = JSONArray()
+        recurringTransactions.forEach { recurring ->
+            array.put(
+                JSONObject().apply {
+                    put("id", recurring.id)
+                    put("type", recurring.type.name)
+                    put("nextOccurrenceMillis", recurring.nextOccurrenceMillis)
+                    put("category", recurring.category)
+                    put("amountCents", recurring.amountCents)
+                    put("frequency", recurring.frequency.name)
+                }
+            )
+        }
+        prefs(context).edit().putString(KEY_RECURRING_TRANSACTIONS, array.toString()).apply()
+    }
+
+    fun saveEntriesAndRecurringTransactions(
+        context: Context,
+        entries: List<FinanceEntry>,
+        recurringTransactions: List<RecurringTransaction>
+    ) {
+        val entriesArray = JSONArray()
+        entries.forEach { entry ->
+            entriesArray.put(
+                JSONObject().apply {
+                    put("id", entry.id)
+                    put("type", entry.type.name)
+                    put("dateMillis", entry.dateMillis)
+                    put("category", entry.category)
+                    put("amountCents", entry.amountCents)
+                    entry.sourceRecurringId?.let { put("sourceRecurringId", it) }
+                }
+            )
+        }
+
+        val recurringArray = JSONArray()
+        recurringTransactions.forEach { recurring ->
+            recurringArray.put(
+                JSONObject().apply {
+                    put("id", recurring.id)
+                    put("type", recurring.type.name)
+                    put("nextOccurrenceMillis", recurring.nextOccurrenceMillis)
+                    put("category", recurring.category)
+                    put("amountCents", recurring.amountCents)
+                    put("frequency", recurring.frequency.name)
+                }
+            )
+        }
+
+        prefs(context).edit()
+            .putString(KEY_ENTRIES, entriesArray.toString())
+            .putString(KEY_RECURRING_TRANSACTIONS, recurringArray.toString())
+            .apply()
         YearIncomeExpenseWidgetUpdater.updateAll(context)
     }
 
@@ -350,6 +467,7 @@ private object FinanceStorage {
         return BackupData(
             categories = loadCategories(context),
             entries = loadEntries(context),
+            recurringTransactions = loadRecurringTransactions(context),
             currencyCode = loadCurrencyCode(context),
             themeMode = loadThemeMode(context),
             hintsEnabled = loadHintsEnabled(context)
@@ -390,6 +508,21 @@ private object FinanceStorage {
                             put("dateMillis", entry.dateMillis)
                             put("category", entry.category)
                             put("amountCents", entry.amountCents)
+                            entry.sourceRecurringId?.let { put("sourceRecurringId", it) }
+                        }
+                    )
+                }
+            })
+            put("recurringTransactions", JSONArray().apply {
+                backupData.recurringTransactions.forEach { recurring ->
+                    put(
+                        JSONObject().apply {
+                            put("id", recurring.id)
+                            put("type", recurring.type.name)
+                            put("nextOccurrenceMillis", recurring.nextOccurrenceMillis)
+                            put("category", recurring.category)
+                            put("amountCents", recurring.amountCents)
+                            put("frequency", recurring.frequency.name)
                         }
                     )
                 }
@@ -409,6 +542,7 @@ private object FinanceStorage {
         val root = JSONObject(contents)
         val categoriesArray = root.optJSONArray("categories") ?: JSONArray()
         val entriesArray = root.optJSONArray("entries") ?: JSONArray()
+        val recurringTransactionsArray = root.optJSONArray("recurringTransactions") ?: JSONArray()
         val importedCurrencyCode = root.optString("currencyCode", defaultCurrencyCode)
             .takeIf { code -> commonCurrencies.any { it.code == code } }
             ?: defaultCurrencyCode
@@ -432,7 +566,24 @@ private object FinanceStorage {
                         type = TransactionType.valueOf(item.getString("type")),
                         dateMillis = item.getLong("dateMillis"),
                         category = item.getString("category"),
-                        amountCents = item.getLong("amountCents")
+                        amountCents = item.getLong("amountCents"),
+                        sourceRecurringId = item.optString("sourceRecurringId").ifBlank { null }
+                    )
+                )
+            }
+        }
+
+        val recurringTransactions = buildList {
+            for (index in 0 until recurringTransactionsArray.length()) {
+                val item = recurringTransactionsArray.getJSONObject(index)
+                add(
+                    RecurringTransaction(
+                        id = item.optString("id").ifBlank { UUID.randomUUID().toString() },
+                        type = TransactionType.valueOf(item.getString("type")),
+                        nextOccurrenceMillis = item.getLong("nextOccurrenceMillis"),
+                        category = item.getString("category"),
+                        amountCents = item.getLong("amountCents"),
+                        frequency = RecurrenceFrequency.valueOf(item.getString("frequency"))
                     )
                 )
             }
@@ -441,6 +592,7 @@ private object FinanceStorage {
         return BackupData(
             categories = categories,
             entries = entries,
+            recurringTransactions = recurringTransactions,
             currencyCode = importedCurrencyCode,
             themeMode = importedThemeMode,
             hintsEnabled = importedHintsEnabled
@@ -506,18 +658,33 @@ private object AutoBackupScheduler {
     }
 }
 
+private const val EXTRA_SKIP_TITLE_SCREEN = "com.tazrog.ive.extra.SKIP_TITLE_SCREEN"
+private const val EXTRA_INITIAL_SECTION = "com.tazrog.ive.extra.INITIAL_SECTION"
+
+internal fun addTransactionWidgetIntent(context: Context): Intent {
+    return Intent(context, MainActivity::class.java).apply {
+        putExtra(EXTRA_SKIP_TITLE_SCREEN, true)
+        putExtra(EXTRA_INITIAL_SECTION, AppSection.HOME.name)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+    }
+}
+
 @Composable
-private fun FinanceTrackerApp() {
+private fun FinanceTrackerApp(
+    skipTitleScreen: Boolean = false,
+    initialSection: AppSection = AppSection.HOME
+) {
     val appContext = LocalContext.current
     val categories = remember { mutableStateListOf<String>() }
     val entries = remember { mutableStateListOf<FinanceEntry>() }
+    val recurringTransactions = remember { mutableStateListOf<RecurringTransaction>() }
     var currencyCode by rememberSaveable { mutableStateOf(defaultCurrencyCode) }
     var themeMode by rememberSaveable { mutableStateOf(ThemeMode.SYSTEM.name) }
     var hintsEnabled by rememberSaveable { mutableStateOf(true) }
     var autoBackupEnabled by rememberSaveable { mutableStateOf(false) }
     var autoBackupMinutes by rememberSaveable { mutableStateOf(2 * 60) }
     var autoBackupTreeUri by rememberSaveable { mutableStateOf<String?>(null) }
-    var showTitleScreen by rememberSaveable { mutableStateOf(true) }
+    var showTitleScreen by rememberSaveable { mutableStateOf(!skipTitleScreen) }
     val selectedThemeMode = ThemeMode.valueOf(themeMode)
     val useDarkTheme = when (selectedThemeMode) {
         ThemeMode.SYSTEM -> isSystemInDarkTheme()
@@ -530,6 +697,19 @@ private fun FinanceTrackerApp() {
         categories.addAll(FinanceStorage.loadCategories(appContext))
         entries.clear()
         entries.addAll(FinanceStorage.loadEntries(appContext))
+        recurringTransactions.clear()
+        recurringTransactions.addAll(FinanceStorage.loadRecurringTransactions(appContext))
+        val recurringSyncResult = syncRecurringTransactions(
+            entries = entries,
+            recurringTransactions = recurringTransactions
+        )
+        if (recurringSyncResult.changed) {
+            entries.clear()
+            entries.addAll(recurringSyncResult.entries.sortedByDescending { it.dateMillis })
+            recurringTransactions.clear()
+            recurringTransactions.addAll(recurringSyncResult.recurringTransactions.sortedBy { it.nextOccurrenceMillis })
+            FinanceStorage.saveEntriesAndRecurringTransactions(appContext, entries, recurringTransactions)
+        }
         currencyCode = FinanceStorage.loadCurrencyCode(appContext)
         themeMode = FinanceStorage.loadThemeMode(appContext).name
         hintsEnabled = FinanceStorage.loadHintsEnabled(appContext)
@@ -537,8 +717,10 @@ private fun FinanceTrackerApp() {
         autoBackupMinutes = FinanceStorage.loadAutoBackupMinutes(appContext)
         autoBackupTreeUri = FinanceStorage.loadAutoBackupTreeUri(appContext)
         AutoBackupScheduler.sync(appContext)
-        delay(1800)
-        showTitleScreen = false
+        if (!skipTitleScreen) {
+            delay(1800)
+            showTitleScreen = false
+        }
     }
 
     IvETheme(darkTheme = useDarkTheme, dynamicColor = false) {
@@ -546,8 +728,10 @@ private fun FinanceTrackerApp() {
             TitleScreen()
         } else {
             FinanceTrackerScreen(
+                initialSection = initialSection,
                 categories = categories,
                 entries = entries,
+                recurringTransactions = recurringTransactions,
                 onAddCategory = { name ->
                     val cleaned = name.trim()
                     val exists = categories.any { it.equals(cleaned, ignoreCase = true) }
@@ -581,9 +765,13 @@ private fun FinanceTrackerApp() {
                                 entries.replaceAll { entry ->
                                     if (entry.category == oldName) entry.copy(category = cleaned) else entry
                                 }
+                                recurringTransactions.replaceAll { recurring ->
+                                    if (recurring.category == oldName) recurring.copy(category = cleaned) else recurring
+                                }
                                 entries.sortByDescending { it.dateMillis }
+                                recurringTransactions.sortBy { it.nextOccurrenceMillis }
                                 FinanceStorage.saveCategories(appContext, categories)
-                                FinanceStorage.saveEntries(appContext, entries)
+                                FinanceStorage.saveEntriesAndRecurringTransactions(appContext, entries, recurringTransactions)
                             }
                             null
                         }
@@ -595,8 +783,9 @@ private fun FinanceTrackerApp() {
                         else -> {
                             categories.remove(category)
                             entries.removeAll { it.category == category }
+                            recurringTransactions.removeAll { it.category == category }
                             FinanceStorage.saveCategories(appContext, categories)
-                            FinanceStorage.saveEntries(appContext, entries)
+                            FinanceStorage.saveEntriesAndRecurringTransactions(appContext, entries, recurringTransactions)
                             null
                         }
                     }
@@ -638,12 +827,33 @@ private fun FinanceTrackerApp() {
                     entries.add(0, entry)
                     FinanceStorage.saveEntries(appContext, entries)
                 },
+                onAddRecurringTransaction = { recurring ->
+                    recurringTransactions.add(recurring)
+                    recurringTransactions.sortBy { it.nextOccurrenceMillis }
+                    FinanceStorage.saveRecurringTransactions(appContext, recurringTransactions)
+                },
                 onUpdateEntry = { updated ->
                     val index = entries.indexOfFirst { it.id == updated.id }
                     if (index >= 0) {
                         entries[index] = updated
                         entries.sortByDescending { it.dateMillis }
                         FinanceStorage.saveEntries(appContext, entries)
+                    }
+                },
+                onUpdateRecurringTransaction = { updated ->
+                    val index = recurringTransactions.indexOfFirst { it.id == updated.id }
+                    if (index >= 0) {
+                        recurringTransactions[index] = updated
+                        recurringTransactions.sortBy { it.nextOccurrenceMillis }
+                        val recurringSyncResult = syncRecurringTransactions(
+                            entries = entries,
+                            recurringTransactions = recurringTransactions
+                        )
+                        entries.clear()
+                        entries.addAll(recurringSyncResult.entries.sortedByDescending { it.dateMillis })
+                        recurringTransactions.clear()
+                        recurringTransactions.addAll(recurringSyncResult.recurringTransactions.sortedBy { it.nextOccurrenceMillis })
+                        FinanceStorage.saveEntriesAndRecurringTransactions(appContext, entries, recurringTransactions)
                     }
                 },
                 onDeleteEntry = { entryId ->
@@ -653,17 +863,31 @@ private fun FinanceTrackerApp() {
                         FinanceStorage.saveEntries(appContext, entries)
                     }
                 },
+                onDeleteRecurringTransaction = { recurringId ->
+                    recurringTransactions.removeAll { it.id == recurringId }
+                    FinanceStorage.saveRecurringTransactions(appContext, recurringTransactions)
+                },
                 onReplaceBackup = { backupData ->
                     categories.clear()
                     categories.addAll(backupData.categories)
                     categories.sortBy { it.lowercase(Locale.getDefault()) }
                     entries.clear()
                     entries.addAll(backupData.entries.sortedByDescending { it.dateMillis })
+                    recurringTransactions.clear()
+                    recurringTransactions.addAll(backupData.recurringTransactions.sortedBy { it.nextOccurrenceMillis })
+                    val recurringSyncResult = syncRecurringTransactions(
+                        entries = entries,
+                        recurringTransactions = recurringTransactions
+                    )
+                    entries.clear()
+                    entries.addAll(recurringSyncResult.entries.sortedByDescending { it.dateMillis })
+                    recurringTransactions.clear()
+                    recurringTransactions.addAll(recurringSyncResult.recurringTransactions.sortedBy { it.nextOccurrenceMillis })
                     currencyCode = backupData.currencyCode
                     themeMode = backupData.themeMode.name
                     hintsEnabled = backupData.hintsEnabled
                     FinanceStorage.saveCategories(appContext, categories)
-                    FinanceStorage.saveEntries(appContext, entries)
+                    FinanceStorage.saveEntriesAndRecurringTransactions(appContext, entries, recurringTransactions)
                     FinanceStorage.saveCurrencyCode(appContext, currencyCode)
                     FinanceStorage.saveThemeMode(appContext, backupData.themeMode)
                     FinanceStorage.saveHintsEnabled(appContext, backupData.hintsEnabled)
@@ -676,8 +900,10 @@ private fun FinanceTrackerApp() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FinanceTrackerScreen(
+    initialSection: AppSection,
     categories: List<String>,
     entries: List<FinanceEntry>,
+    recurringTransactions: List<RecurringTransaction>,
     onAddCategory: (String) -> String?,
     onUpdateCategory: (String, String) -> String?,
     onRemoveCategory: (String) -> String?,
@@ -694,8 +920,11 @@ private fun FinanceTrackerScreen(
     autoBackupTreeUri: String?,
     onAutoBackupTreeUriChange: (String?) -> Unit,
     onAddEntry: (FinanceEntry) -> Unit,
+    onAddRecurringTransaction: (RecurringTransaction) -> Unit,
     onUpdateEntry: (FinanceEntry) -> Unit,
+    onUpdateRecurringTransaction: (RecurringTransaction) -> Unit,
     onDeleteEntry: (String) -> Unit,
+    onDeleteRecurringTransaction: (String) -> Unit,
     onReplaceBackup: (BackupData) -> Unit
 ) {
     val appContext = LocalContext.current
@@ -708,6 +937,8 @@ private fun FinanceTrackerScreen(
     var selectedDateMillis by rememberSaveable { mutableStateOf(todayAtMidnight()) }
     var selectedCategory by rememberSaveable { mutableStateOf("") }
     var amountInput by rememberSaveable { mutableStateOf("") }
+    var recurringEnabled by rememberSaveable { mutableStateOf(false) }
+    var recurringFrequencyName by rememberSaveable { mutableStateOf(RecurrenceFrequency.MONTHLY.name) }
     var newCategoryInput by rememberSaveable { mutableStateOf("") }
     var feedbackMessage by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedYear by rememberSaveable { mutableStateOf(currentYear) }
@@ -716,6 +947,8 @@ private fun FinanceTrackerScreen(
     var transactionSearchQuery by rememberSaveable { mutableStateOf("") }
     var editingEntryId by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingDeleteEntryId by rememberSaveable { mutableStateOf<String?>(null) }
+    var editingRecurringTransactionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingDeleteRecurringTransactionId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingCategory by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingCategoryDelete by rememberSaveable { mutableStateOf<PendingCategoryDelete?>(null) }
     var pendingTransaction by rememberSaveable { mutableStateOf<PendingTransaction?>(null) }
@@ -733,6 +966,7 @@ private fun FinanceTrackerScreen(
                     backupData = BackupData(
                         categories = categories,
                         entries = entries,
+                        recurringTransactions = recurringTransactions,
                         currencyCode = currencyCode,
                         themeMode = themeMode,
                         hintsEnabled = hintsEnabled
@@ -786,8 +1020,9 @@ private fun FinanceTrackerScreen(
         }
     }
     val swipeSections = availableSections
+    val initialPage = swipeSections.indexOf(initialSection).takeIf { it >= 0 } ?: 0
     val swipePagerState = rememberPagerState(
-        initialPage = 0,
+        initialPage = initialPage,
         pageCount = { swipeSections.size }
     )
     val activeSection = swipeSections.getOrElse(swipePagerState.currentPage) { swipeSections.first() }
@@ -897,6 +1132,8 @@ private fun FinanceTrackerScreen(
 
     val editingEntry = entries.firstOrNull { it.id == editingEntryId }
     val pendingDeleteEntry = entries.firstOrNull { it.id == pendingDeleteEntryId }
+    val editingRecurringTransaction = recurringTransactions.firstOrNull { it.id == editingRecurringTransactionId }
+    val pendingDeleteRecurringTransaction = recurringTransactions.firstOrNull { it.id == pendingDeleteRecurringTransactionId }
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -948,6 +1185,10 @@ private fun FinanceTrackerScreen(
                             onSelectedCategoryChange = { selectedCategory = it },
                             amountInput = amountInput,
                             onAmountInputChange = { amountInput = it },
+                            recurringEnabled = recurringEnabled,
+                            onRecurringEnabledChange = { recurringEnabled = it },
+                            recurringFrequency = RecurrenceFrequency.valueOf(recurringFrequencyName),
+                            onRecurringFrequencyChange = { recurringFrequencyName = it.name },
                             currencyCode = currencyCode,
                             currentYear = currentYear,
                             currentYearIncome = currentYearIncome,
@@ -963,7 +1204,12 @@ private fun FinanceTrackerScreen(
                                             type = selectedType,
                                             dateMillis = selectedDateMillis,
                                             category = selectedCategory,
-                                            amountCents = cents
+                                            amountCents = cents,
+                                            recurringFrequency = if (recurringEnabled) {
+                                                RecurrenceFrequency.valueOf(recurringFrequencyName)
+                                            } else {
+                                                null
+                                            }
                                         )
                                         null
                                     }
@@ -1022,10 +1268,15 @@ private fun FinanceTrackerScreen(
                             transactionSearchQuery = transactionSearchQuery,
                             onTransactionSearchQueryChange = { transactionSearchQuery = it },
                             entries = searchedEntries,
+                            recurringTransactions = recurringTransactions.sortedBy { it.nextOccurrenceMillis },
                             isShowingSearchResults = transactionSearchQuery.isNotBlank(),
                             currencyCode = currencyCode,
                             onEditEntry = { entry -> editingEntryId = entry.id },
-                            onDeleteEntry = { entry -> pendingDeleteEntryId = entry.id }
+                            onDeleteEntry = { entry -> pendingDeleteEntryId = entry.id },
+                            onEditRecurringTransaction = { recurring -> editingRecurringTransactionId = recurring.id },
+                            onDeleteRecurringTransaction = { recurring ->
+                                pendingDeleteRecurringTransactionId = recurring.id
+                            }
                         )
 
                         AppSection.HINTS -> HintsSection()
@@ -1197,6 +1448,9 @@ private fun FinanceTrackerScreen(
                     Text("Date: ${formatDate(draft.dateMillis)}")
                     Text("Category: ${draft.category}")
                     Text("Amount: ${formatCurrency(draft.amountCents, currencyCode)}")
+                    draft.recurringFrequency?.let {
+                        Text("Repeats: ${it.label}")
+                    }
                 }
             },
             confirmButton = {
@@ -1211,8 +1465,22 @@ private fun FinanceTrackerScreen(
                                 amountCents = draft.amountCents
                             )
                         )
+                        draft.recurringFrequency?.let { frequency ->
+                            onAddRecurringTransaction(
+                                RecurringTransaction(
+                                    id = UUID.randomUUID().toString(),
+                                    type = draft.type,
+                                    nextOccurrenceMillis = advanceRecurringDate(draft.dateMillis, frequency),
+                                    category = draft.category,
+                                    amountCents = draft.amountCents,
+                                    frequency = frequency
+                                )
+                            )
+                        }
                         pendingTransaction = null
                         amountInput = ""
+                        recurringEnabled = false
+                        recurringFrequencyName = RecurrenceFrequency.MONTHLY.name
                         feedbackMessage = "${draft.type.name.lowercase(Locale.getDefault()).replaceFirstChar { it.titlecase(Locale.getDefault()) }} saved for ${draft.category}."
                     }
                 ) {
@@ -1221,6 +1489,64 @@ private fun FinanceTrackerScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingTransaction = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    editingRecurringTransaction?.let { recurring ->
+        EditRecurringTransactionDialog(
+            categories = categories,
+            recurringTransaction = recurring,
+            currencyCode = currencyCode,
+            onDismiss = { editingRecurringTransactionId = null },
+            onSave = { draft ->
+                val cents = parseAmountToMinorUnits(draft.amountInput, currencyCode)
+                feedbackMessage = when {
+                    draft.category.isBlank() -> "Select a category."
+                    cents == null || cents <= 0L -> "Enter a valid amount."
+                    else -> {
+                        onUpdateRecurringTransaction(
+                            recurring.copy(
+                                type = draft.type,
+                                nextOccurrenceMillis = draft.dateMillis,
+                                category = draft.category,
+                                amountCents = cents,
+                                frequency = draft.recurringFrequency
+                            )
+                        )
+                        editingRecurringTransactionId = null
+                        "Recurring transaction updated: ${draft.category}."
+                    }
+                }
+            }
+        )
+    }
+
+    pendingDeleteRecurringTransaction?.let { recurring ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteRecurringTransactionId = null },
+            title = { TitleWithAppIcon("Remove Recurring Transaction") },
+            text = {
+                Text(
+                    "Remove future ${recurring.frequency.label.lowercase(Locale.getDefault())} entries for " +
+                        "${recurring.category} starting ${formatDate(recurring.nextOccurrenceMillis)}?"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDeleteRecurringTransaction(recurring.id)
+                        pendingDeleteRecurringTransactionId = null
+                        feedbackMessage = "Recurring transaction removed: ${recurring.category}."
+                    }
+                ) {
+                    Text("Remove")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteRecurringTransactionId = null }) {
                     Text("Cancel")
                 }
             }
@@ -1408,6 +1734,10 @@ private fun HomeSection(
     onSelectedCategoryChange: (String) -> Unit,
     amountInput: String,
     onAmountInputChange: (String) -> Unit,
+    recurringEnabled: Boolean,
+    onRecurringEnabledChange: (Boolean) -> Unit,
+    recurringFrequency: RecurrenceFrequency,
+    onRecurringFrequencyChange: (RecurrenceFrequency) -> Unit,
     currencyCode: String,
     currentYear: Int,
     currentYearIncome: Long,
@@ -1425,6 +1755,10 @@ private fun HomeSection(
         onSelectedCategoryChange = onSelectedCategoryChange,
         amountInput = amountInput,
         onAmountInputChange = onAmountInputChange,
+        recurringEnabled = recurringEnabled,
+        onRecurringEnabledChange = onRecurringEnabledChange,
+        recurringFrequency = recurringFrequency,
+        onRecurringFrequencyChange = onRecurringFrequencyChange,
         currencyCode = currencyCode,
         onSaveEntry = onSaveEntry,
         appContext = appContext
@@ -1464,40 +1798,36 @@ private fun HintsSection() {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             TitleWithAppIcon(
-                text = "How to Use I>E",
+                text = "About I>E",
                 style = MaterialTheme.typography.titleLarge
             )
             Text(
-                text = "I>E is meant to stay simple. The goal is to record money coming in and money going out, then use the summaries to help keep income higher than expenses.",
+                text = "I>E is a simple income-versus-expense tracker. It records one-time and recurring transactions, keeps recent activity easy to review, and shows whether income is staying ahead of expenses over time.",
                 style = MaterialTheme.typography.bodyLarge
             )
             HintCard(
-                title = "Start on Home",
-                message = "Use Home to enter a new transaction quickly. Pick Income or Expense, choose the date and category, then type only numbers for the amount. I>E places the decimal automatically for the selected currency."
+                title = "Home",
+                message = "Use Home to add a transaction quickly. Pick Income or Expense, choose the date and category, type digits only for the amount, and turn on Recurring when the transaction should repeat daily, weekly, monthly, or yearly."
             )
             HintCard(
-                title = "Save Carefully",
-                message = "After entering a transaction, I>E shows a confirmation dialog with the details. Review the type, date, category, and amount, then choose Save or Cancel."
+                title = "Recurring Transactions",
+                message = "When you save a recurring transaction, I>E saves the current entry and also stores a repeating rule for future dates. When the app opens, any due recurring entries are auto-entered once and linked back to that rule so duplicates are not created."
             )
             HintCard(
-                title = "Manage Categories",
-                message = "Use Categories to add, rename, or remove category names. If you rename a category, related transactions are updated. If you remove one, I>E warns you that matching transactions will also be deleted."
+                title = "Transactions Screen",
+                message = "The Transactions screen now has two tabs. Recent shows the latest 10 saved transactions unless you search. Recurring shows every repeating rule with options to edit or remove future occurrences."
             )
             HintCard(
-                title = "Read the Stats",
-                message = "Use Stats to swipe between Summary, Month, Year, and Category views. Apply filters, switch between Chart and Values modes, and compare income against expenses without a long scrolling screen."
+                title = "Editing Rules",
+                message = "Editing or deleting a recurring transaction only affects future auto-entered items. Transactions that were already saved or already auto-entered stay in your history unchanged."
             )
             HintCard(
-                title = "Review Transactions",
-                message = "Use Transactions to search your full history, edit older entries, or remove them. When you are not searching, I>E shows the 10 most recent transactions to keep the screen clean."
+                title = "Categories and Stats",
+                message = "Use Categories to add, rename, or remove category names. Category updates also apply to recurring rules. Use Stats to filter by year, month, or category and compare income against expense in chart or values views."
             )
             HintCard(
-                title = "Settings and Backups",
-                message = "Use Settings to choose your currency, theme, and hint visibility. Export a backup file regularly so you can restore your categories, transactions, and preferences later."
-            )
-            HintCard(
-                title = "Core Logic",
-                message = "The idea behind the program is to keep tracking easy enough to do every time. Simple records are more useful than complicated records, and the main target is to keep total income above total expense over time."
+                title = "Backups and Preferences",
+                message = "Use Settings to choose your currency, theme, automatic backup options, and About visibility. Backups now include categories, saved transactions, recurring rules, currency, theme, and About visibility."
             )
         }
     }
@@ -1839,48 +2169,87 @@ private fun TransactionsSection(
     transactionSearchQuery: String,
     onTransactionSearchQueryChange: (String) -> Unit,
     entries: List<FinanceEntry>,
+    recurringTransactions: List<RecurringTransaction>,
     isShowingSearchResults: Boolean,
     currencyCode: String,
     onEditEntry: (FinanceEntry) -> Unit,
-    onDeleteEntry: (FinanceEntry) -> Unit
+    onDeleteEntry: (FinanceEntry) -> Unit,
+    onEditRecurringTransaction: (RecurringTransaction) -> Unit,
+    onDeleteRecurringTransaction: (RecurringTransaction) -> Unit
 ) {
+    var selectedTabIndex by rememberSaveable { mutableStateOf(0) }
+    val tabTitles = listOf("Recent", "Recurring")
+
     Card {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            TitleWithAppIcon(
-                text = if (isShowingSearchResults) "Search Results" else "Recent Transactions",
-                style = MaterialTheme.typography.titleLarge
-            )
+            TitleWithAppIcon(text = "Transactions", style = MaterialTheme.typography.titleLarge)
 
-            OutlinedTextField(
-                value = transactionSearchQuery,
-                onValueChange = onTransactionSearchQueryChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Search Transactions") },
-                placeholder = { Text("Search by category, date, type, or amount") },
-                singleLine = true
-            )
-
-            if (entries.isEmpty()) {
-                Text(if (isShowingSearchResults) "No transactions match your search." else "No transactions yet.")
-            } else {
-                if (!isShowingSearchResults) {
-                    Text(
-                        text = "Showing the 10 most recent transactions. Use Search to find older entries.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+            TabRow(selectedTabIndex = selectedTabIndex) {
+                tabTitles.forEachIndexed { index, title ->
+                    Tab(
+                        selected = selectedTabIndex == index,
+                        onClick = { selectedTabIndex = index },
+                        text = { Text(title) }
                     )
                 }
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    entries.forEach { entry ->
-                        TransactionRow(
-                            entry = entry,
-                            currencyCode = currencyCode,
-                            onEdit = { onEditEntry(entry) },
-                            onDelete = { onDeleteEntry(entry) }
+            }
+
+            if (selectedTabIndex == 0) {
+                TitleWithAppIcon(
+                    text = if (isShowingSearchResults) "Search Results" else "Recent Transactions",
+                    style = MaterialTheme.typography.titleMedium
+                )
+
+                OutlinedTextField(
+                    value = transactionSearchQuery,
+                    onValueChange = onTransactionSearchQueryChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Search Transactions") },
+                    placeholder = { Text("Search by category, date, type, or amount") },
+                    singleLine = true
+                )
+
+                if (entries.isEmpty()) {
+                    Text(if (isShowingSearchResults) "No transactions match your search." else "No transactions yet.")
+                } else {
+                    if (!isShowingSearchResults) {
+                        Text(
+                            text = "Showing the 10 most recent transactions. Use Search to find older entries.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        entries.forEach { entry ->
+                            TransactionRow(
+                                entry = entry,
+                                currencyCode = currencyCode,
+                                onEdit = { onEditEntry(entry) },
+                                onDelete = { onDeleteEntry(entry) }
+                            )
+                        }
+                    }
+                }
+            } else {
+                TitleWithAppIcon(
+                    text = "Recurring Transactions",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                if (recurringTransactions.isEmpty()) {
+                    Text("No recurring transactions yet.")
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        recurringTransactions.forEach { recurring ->
+                            RecurringTransactionRow(
+                                recurringTransaction = recurring,
+                                currencyCode = currencyCode,
+                                onEdit = { onEditRecurringTransaction(recurring) },
+                                onDelete = { onDeleteRecurringTransaction(recurring) }
+                            )
+                        }
                     }
                 }
             }
@@ -1979,6 +2348,140 @@ private fun EditTransactionDialog(
                             dateMillis = selectedDateMillis,
                             category = selectedCategory,
                             amountInput = amountInput
+                        )
+                    )
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun EditRecurringTransactionDialog(
+    categories: List<String>,
+    recurringTransaction: RecurringTransaction,
+    currencyCode: String,
+    onDismiss: () -> Unit,
+    onSave: (RecurringTransactionDraft) -> Unit
+) {
+    var selectedType by remember(recurringTransaction.id) { mutableStateOf(recurringTransaction.type) }
+    var selectedDateMillis by remember(recurringTransaction.id) {
+        mutableStateOf(recurringTransaction.nextOccurrenceMillis)
+    }
+    var selectedCategory by remember(recurringTransaction.id) { mutableStateOf(recurringTransaction.category) }
+    var amountInput by remember(recurringTransaction.id) {
+        mutableStateOf(formatMinorUnitsForInput(recurringTransaction.amountCents, currencyCode))
+    }
+    var selectedFrequency by remember(recurringTransaction.id) { mutableStateOf(recurringTransaction.frequency) }
+    var categoryMenuExpanded by remember(recurringTransaction.id) { mutableStateOf(false) }
+    var frequencyMenuExpanded by remember(recurringTransaction.id) { mutableStateOf(false) }
+    val appContext = LocalContext.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { TitleWithAppIcon("Edit Recurring Transaction") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                TransactionTypeSelector(
+                    selectedType = selectedType,
+                    onSelectedTypeChange = { selectedType = it }
+                )
+
+                OutlinedButton(
+                    onClick = {
+                        showDatePicker(
+                            pickerContext = appContext,
+                            initialMillis = selectedDateMillis
+                        ) { pickedMillis ->
+                            selectedDateMillis = pickedMillis
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Next Date: ${formatDate(selectedDateMillis)}")
+                }
+
+                Box {
+                    OutlinedButton(
+                        onClick = { categoryMenuExpanded = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = categories.isNotEmpty()
+                    ) {
+                        Text(
+                            text = if (selectedCategory.isBlank()) {
+                                "Select Category"
+                            } else {
+                                "Category: $selectedCategory"
+                            }
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = categoryMenuExpanded,
+                        onDismissRequest = { categoryMenuExpanded = false },
+                        modifier = Modifier.heightIn(max = 320.dp)
+                    ) {
+                        categories.forEach { category ->
+                            DropdownMenuItem(
+                                text = { Text(category) },
+                                onClick = {
+                                    selectedCategory = category
+                                    categoryMenuExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = amountInput,
+                    onValueChange = { amountInput = normalizeAmountInput(it, currencyCode) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Amount ($currencyCode)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+
+                Box {
+                    OutlinedButton(
+                        onClick = { frequencyMenuExpanded = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Repeats: ${selectedFrequency.label}")
+                    }
+                    DropdownMenu(
+                        expanded = frequencyMenuExpanded,
+                        onDismissRequest = { frequencyMenuExpanded = false }
+                    ) {
+                        RecurrenceFrequency.entries.forEach { frequency ->
+                            DropdownMenuItem(
+                                text = { Text(frequency.label) },
+                                onClick = {
+                                    selectedFrequency = frequency
+                                    frequencyMenuExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(
+                        RecurringTransactionDraft(
+                            type = selectedType,
+                            dateMillis = selectedDateMillis,
+                            category = selectedCategory,
+                            amountInput = amountInput,
+                            recurringFrequency = selectedFrequency
                         )
                     )
                 }
@@ -2209,7 +2712,7 @@ private fun SettingsSection(
                 fontWeight = FontWeight.Medium
             )
             Text(
-                text = "1. Start on Home and add categories if you need more than the defaults.\n2. Enter transaction amounts by typing digits only; the decimal is placed automatically.\n3. Review the confirmation dialog before saving a transaction.\n4. Use Stats to filter by year, month, or category, then switch between Chart and Values views.\n5. Use Transactions to search, edit, or remove saved entries.\n6. Open the Hints page from the menu for quick guidance on using the app.\n7. Export a backup from Settings before switching devices or clearing app data.",
+                text = "1. Use Home to add one-time or recurring transactions.\n2. Turn on Recurring to repeat a transaction daily, weekly, monthly, or yearly.\n3. Use Transactions > Recent to review the latest 10 saved entries or search older ones.\n4. Use Transactions > Recurring to edit or remove repeating rules without changing past entries.\n5. Use Stats to compare income and expense by month, year, or category.\n6. Export or import backups from Settings to keep categories, transactions, recurring rules, and preferences safe.\n7. Show or hide the About page from Settings if you want a cleaner menu.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2570,6 +3073,62 @@ private fun TransactionRow(
 }
 
 @Composable
+private fun RecurringTransactionRow(
+    recurringTransaction: RecurringTransaction,
+    currencyCode: String,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(recurringTransaction.category, fontWeight = FontWeight.Medium)
+                    Text(
+                        text = "Next: ${formatDate(recurringTransaction.nextOccurrenceMillis)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "Repeats ${recurringTransaction.frequency.label.lowercase(Locale.getDefault())}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Text(
+                    text = if (recurringTransaction.type == TransactionType.INCOME) "Income" else "Expense",
+                    color = if (recurringTransaction.type == TransactionType.INCOME) positiveColor else negativeColor,
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                )
+                Text(
+                    text = formatCurrency(recurringTransaction.amountCents, currencyCode),
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(onClick = onEdit) {
+                    Text("Edit")
+                }
+                TextButton(onClick = onDelete) {
+                    Text("Remove")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun SummaryTile(label: String, value: String, accent: Color, modifier: Modifier = Modifier) {
     Card(
         modifier = modifier,
@@ -2604,11 +3163,16 @@ private fun AddTransactionCard(
     onSelectedCategoryChange: (String) -> Unit,
     amountInput: String,
     onAmountInputChange: (String) -> Unit,
+    recurringEnabled: Boolean,
+    onRecurringEnabledChange: (Boolean) -> Unit,
+    recurringFrequency: RecurrenceFrequency,
+    onRecurringFrequencyChange: (RecurrenceFrequency) -> Unit,
     currencyCode: String,
     onSaveEntry: () -> Unit,
     appContext: Context
 ) {
     var categoryMenuExpanded by remember { mutableStateOf(false) }
+    var recurringMenuExpanded by remember { mutableStateOf(false) }
     var amountFieldValue by remember {
         mutableStateOf(TextFieldValue(amountInput, TextRange(amountInput.length)))
     }
@@ -2699,6 +3263,54 @@ private fun AddTransactionCard(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true
             )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Recurring Transaction", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        text = if (recurringEnabled) {
+                            "Future entries will repeat ${recurringFrequency.label.lowercase(Locale.getDefault())}."
+                        } else {
+                            "Save this as a one-time transaction."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = recurringEnabled,
+                    onCheckedChange = onRecurringEnabledChange
+                )
+            }
+
+            if (recurringEnabled) {
+                Box {
+                    OutlinedButton(
+                        onClick = { recurringMenuExpanded = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Repeats: ${recurringFrequency.label}")
+                    }
+                    DropdownMenu(
+                        expanded = recurringMenuExpanded,
+                        onDismissRequest = { recurringMenuExpanded = false }
+                    ) {
+                        RecurrenceFrequency.entries.forEach { frequency ->
+                            DropdownMenuItem(
+                                text = { Text(frequency.label) },
+                                onClick = {
+                                    onRecurringFrequencyChange(frequency)
+                                    recurringMenuExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
 
             Button(
                 onClick = onSaveEntry,
@@ -2920,6 +3532,80 @@ private fun createdByLabel(): String {
     return "Created by tazrog © 2026."
 }
 
+private data class RecurringSyncResult(
+    val entries: List<FinanceEntry>,
+    val recurringTransactions: List<RecurringTransaction>,
+    val changed: Boolean
+)
+
+private fun syncRecurringTransactions(
+    entries: List<FinanceEntry>,
+    recurringTransactions: List<RecurringTransaction>,
+    todayMillis: Long = todayAtMidnight()
+): RecurringSyncResult {
+    val updatedEntries = entries.toMutableList()
+    val updatedRecurringTransactions = recurringTransactions.map { recurring ->
+        var nextOccurrence = normalizeToMidnight(recurring.nextOccurrenceMillis)
+
+        while (nextOccurrence <= todayMillis) {
+            val alreadyExists = updatedEntries.any { entry ->
+                entry.sourceRecurringId == recurring.id && normalizeToMidnight(entry.dateMillis) == nextOccurrence
+            }
+            if (!alreadyExists) {
+                updatedEntries.add(
+                    FinanceEntry(
+                        id = UUID.randomUUID().toString(),
+                        type = recurring.type,
+                        dateMillis = nextOccurrence,
+                        category = recurring.category,
+                        amountCents = recurring.amountCents,
+                        sourceRecurringId = recurring.id
+                    )
+                )
+            }
+            nextOccurrence = advanceRecurringDate(nextOccurrence, recurring.frequency)
+        }
+
+        recurring.copy(nextOccurrenceMillis = nextOccurrence)
+    }.sortedBy { it.nextOccurrenceMillis }
+
+    val sortedEntries = updatedEntries.sortedByDescending { it.dateMillis }
+    val changed = sortedEntries != entries.sortedByDescending { it.dateMillis } ||
+        updatedRecurringTransactions != recurringTransactions.sortedBy { it.nextOccurrenceMillis }
+
+    return RecurringSyncResult(
+        entries = sortedEntries,
+        recurringTransactions = updatedRecurringTransactions,
+        changed = changed
+    )
+}
+
+private fun advanceRecurringDate(dateMillis: Long, frequency: RecurrenceFrequency): Long {
+    return Calendar.getInstance().apply {
+        timeInMillis = normalizeToMidnight(dateMillis)
+        when (frequency) {
+            RecurrenceFrequency.DAILY -> add(Calendar.DAY_OF_YEAR, 1)
+            RecurrenceFrequency.WEEKLY -> add(Calendar.WEEK_OF_YEAR, 1)
+            RecurrenceFrequency.MONTHLY -> add(Calendar.MONTH, 1)
+            RecurrenceFrequency.YEARLY -> add(Calendar.YEAR, 1)
+        }
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }.timeInMillis
+}
+
+private fun normalizeToMidnight(dateMillis: Long): Long {
+    return Calendar.getInstance().apply {
+        timeInMillis = dateMillis
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }.timeInMillis
+}
+
 private fun millisToYear(dateMillis: Long): Int {
     return Calendar.getInstance().apply { timeInMillis = dateMillis }.get(Calendar.YEAR)
 }
@@ -2967,6 +3653,7 @@ private val inactiveTypeColor = Color(0xFF7A7A7A)
 private fun FinanceTrackerPreview() {
     IvETheme {
         FinanceTrackerScreen(
+            initialSection = AppSection.HOME,
             categories = listOf("Salary", "Food", "Travel"),
             entries = listOf(
                 FinanceEntry(
@@ -2982,6 +3669,16 @@ private fun FinanceTrackerPreview() {
                     dateMillis = todayAtMidnight(),
                     category = "Food",
                     amountCents = 2599
+                )
+            ),
+            recurringTransactions = listOf(
+                RecurringTransaction(
+                    id = "r1",
+                    type = TransactionType.EXPENSE,
+                    nextOccurrenceMillis = advanceRecurringDate(todayAtMidnight(), RecurrenceFrequency.MONTHLY),
+                    category = "Housing",
+                    amountCents = 120000,
+                    frequency = RecurrenceFrequency.MONTHLY
                 )
             ),
             onAddCategory = { null },
@@ -3000,8 +3697,11 @@ private fun FinanceTrackerPreview() {
             autoBackupTreeUri = null,
             onAutoBackupTreeUriChange = {},
             onAddEntry = {},
+            onAddRecurringTransaction = {},
             onUpdateEntry = {},
+            onUpdateRecurringTransaction = {},
             onDeleteEntry = {},
+            onDeleteRecurringTransaction = {},
             onReplaceBackup = {}
         )
     }
