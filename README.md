@@ -1,6 +1,6 @@
 # Income > Expense
 
-`Income > Expense` (`I>E`) is an Android finance tracker built with Kotlin and Jetpack Compose. It focuses on fast entry, simple summaries, recurring transactions, local backup/export, and home screen widgets.
+`Income > Expense` (`I>E`) is an Android finance tracker built with Kotlin and Jetpack Compose. It focuses on fast entry, simple summaries, recurring transactions, local backup/export with basic password protection, and home screen widgets.
 
 ## Current Features
 
@@ -12,6 +12,7 @@
 - Choose the display currency used for amounts and summaries
 - Switch between system, light, and dark theme modes
 - Export and import backup files
+- Protect backup files with a basic password-based encryption layer
 - Schedule one automatic backup per day to a user-selected folder
 - Use two widgets:
   - `Add Transaction` widget to jump directly into entry flow
@@ -58,5 +59,6 @@ Expected outputs:
 ## Notes
 
 - App data is stored locally with `SharedPreferences`
+- Backup password protection is basic and intended for light privacy, not high-security storage
 - Automatic backup depends on the user selecting a writable document tree
 - The boot/package-replaced receiver re-syncs scheduled automatic backups after restart or app update

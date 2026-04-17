@@ -165,8 +165,8 @@ private enum class AppSection(val title: String, val subtitle: String) {
     CATEGORIES("Categories", "Manage the categories available for your transactions."),
     STATS("Stats", "View summaries and charts by month, year, and category."),
     TRANSACTIONS("Transactions", "Search, edit, and remove saved transactions."),
-    SETTINGS("Settings", "Choose your currency, theme, backups, and about visibility."),
-    HINTS("About", "Read how I>E works, including recurring transactions and backups.")
+    SETTINGS("Settings", "Choose your currency, theme, and backups."),
+    HINTS("About", "Read how I>E works, including recurring transactions and basic backup protection.")
 }
 
 private data class FinanceEntry(
@@ -1480,11 +1480,6 @@ private fun FinanceTrackerScreen(
                                 onThemeModeChange(it)
                                 feedbackMessage = "Theme changed to ${it.label}."
                             },
-                            hintsEnabled = hintsEnabled,
-                            onHintsEnabledChange = {
-                                onHintsEnabledChange(it)
-                                feedbackMessage = if (it) "Hints turned on." else "Hints turned off."
-                            },
                             autoBackupEnabled = autoBackupEnabled,
                             onAutoBackupEnabledChange = { enabled ->
                                 if (enabled && autoBackupTreeUri.isNullOrBlank()) {
@@ -2068,7 +2063,7 @@ private fun HintsSection() {
             )
             HintCard(
                 title = "Backups and Preferences",
-                message = "Use Settings to choose your currency, theme, automatic backup options, and About visibility. Backups now include categories, saved transactions, recurring rules, currency, theme, and About visibility."
+                message = "Use Settings to choose your currency, theme, and backup options. Backup files can use a password for basic encryption so your exported data is not left as plain text, but this is simple protection rather than high-security storage."
             )
         }
     }
@@ -2785,8 +2780,6 @@ private fun SettingsSection(
     onSelectedCurrencyCodeChange: (String) -> Unit,
     selectedThemeMode: ThemeMode,
     onSelectedThemeModeChange: (ThemeMode) -> Unit,
-    hintsEnabled: Boolean,
-    onHintsEnabledChange: (Boolean) -> Unit,
     autoBackupEnabled: Boolean,
     onAutoBackupEnabledChange: (Boolean) -> Unit,
     autoBackupMinutes: Int,
@@ -2881,7 +2874,7 @@ private fun SettingsSection(
                 style = MaterialTheme.typography.titleLarge
             )
             Text(
-                text = "Export your data to a file or import a previous backup.",
+                text = "Export your data to a file or import a previous backup. If you save a backup password, I>E uses basic encryption to protect the backup contents.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2891,7 +2884,7 @@ private fun SettingsSection(
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Backup password") },
                 supportingText = {
-                    Text("This password is stored on the device and used for manual and automatic backups.")
+                    Text("This password is stored on the device and used for manual and automatic backups. It adds basic protection, not advanced security.")
                 },
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation()
@@ -2982,23 +2975,6 @@ private fun SettingsSection(
             ) {
                 Text("Import Backup")
             }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            TitleWithAppIcon(
-                text = "About",
-                style = MaterialTheme.typography.titleLarge
-            )
-            Text(
-                text = "How to Use I>E",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Medium
-            )
-            Text(
-                text = "1. Use Home to add one-time or recurring transactions.\n2. Turn on Recurring to repeat a transaction daily, weekly, monthly, or yearly.\n3. Use Transactions > Recent to review the latest 10 saved entries or search older ones.\n4. Use Transactions > Recurring to edit or remove repeating rules without changing past entries.\n5. Use Stats to compare income and expense by month, year, or category.\n6. Export or import backups from Settings to keep categories, transactions, recurring rules, and preferences safe.\n7. Show or hide the About page from Settings if you want a cleaner menu.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }
