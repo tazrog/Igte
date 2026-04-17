@@ -1,16 +1,8 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
--->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- Backup behavior is managed by the app's export and import tools. -->
+        <include domain="sharedpref" path="finance_tracker.xml" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <include domain="sharedpref" path="finance_tracker.xml" />
     </device-transfer>
-    -->
 </data-extraction-rules>

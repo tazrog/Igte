@@ -11,6 +11,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.util.Base64
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
@@ -83,6 +84,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -100,10 +102,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
+import java.security.MessageDigest
 import java.util.Calendar
 import java.util.Currency
 import java.util.Locale
 import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -137,7 +145,8 @@ class AutoBackupReceiver : BroadcastReceiver() {
                     FinanceStorage.exportBackup(
                         context = context,
                         uri = backupUri,
-                        backupData = FinanceStorage.buildBackupData(context)
+                        backupData = FinanceStorage.buildBackupData(context),
+                        password = FinanceStorage.loadBackupPassword(context)
                     )
                 }
                 AutoBackupScheduler.sync(context)
@@ -239,6 +248,11 @@ private data class BackupData(
     val hintsEnabled: Boolean
 )
 
+private data class PendingBackupImport(
+    val uri: Uri,
+    val suggestedPassword: String
+)
+
 private const val allYearMonth = -1
 private const val MAX_CATEGORY_NAME_LENGTH = 10
 
@@ -271,6 +285,30 @@ private object FinanceStorage {
     private const val KEY_AUTO_BACKUP_ENABLED = "auto_backup_enabled"
     private const val KEY_AUTO_BACKUP_MINUTES = "auto_backup_minutes"
     private const val KEY_AUTO_BACKUP_TREE_URI = "auto_backup_tree_uri"
+    private const val KEY_BACKUP_PASSWORD = "backup_password"
+    private const val OBFUSCATED_PREFIX = "enc:v2:"
+    private const val LEGACY_ENCRYPTED_PREFIX = "enc:v1:"
+    private const val BACKUP_VERSION_PLAINTEXT = 1
+    private const val BACKUP_VERSION_ENCRYPTED = 2
+    private const val BACKUP_VERSION_PASSWORD = 3
+    private const val BACKUP_PAYLOAD_KEY = "payload"
+    private const val BACKUP_ENCRYPTED_KEY = "encrypted"
+    private const val BACKUP_PASSWORD_PROTECTED_KEY = "passwordProtected"
+    private const val BACKUP_SALT_KEY = "salt"
+    private const val PBKDF2_ITERATIONS = 120_000
+    private const val AES_KEY_BITS = 256
+    private const val GCM_IV_LENGTH_BYTES = 12
+    private const val GCM_TAG_LENGTH_BITS = 128
+    private const val DERIVED_SECRET =
+        "IvE backup and storage key v1. This is app-level obfuscation, not a user password."
+    private val KEY_SALT = byteArrayOf(
+        0x13, 0x49, 0x76, 0x45, 0x2D, 0x53, 0x61, 0x6C,
+        0x74, 0x2D, 0x76, 0x31, 0x21, 0x2A, 0x33, 0x5E
+    )
+    private val obfuscationKey by lazy {
+        MessageDigest.getInstance("SHA-256")
+            .digest((DERIVED_SECRET + KEY_SALT.decodeToString()).toByteArray(Charsets.UTF_8))
+    }
 
     private val defaultCategories = listOf(
         "Salary",
@@ -283,7 +321,7 @@ private object FinanceStorage {
 
     fun loadCategories(context: Context): List<String> {
         val prefs = prefs(context)
-        val saved = prefs.getString(KEY_CATEGORIES, null) ?: return defaultCategories
+        val saved = readEncryptedString(prefs, KEY_CATEGORIES) ?: return defaultCategories
         val array = JSONArray(saved)
         return buildList {
             for (index in 0 until array.length()) {
@@ -295,11 +333,11 @@ private object FinanceStorage {
     fun saveCategories(context: Context, categories: List<String>) {
         val array = JSONArray()
         categories.forEach(array::put)
-        prefs(context).edit().putString(KEY_CATEGORIES, array.toString()).apply()
+        writeEncryptedString(prefs(context), KEY_CATEGORIES, array.toString())
     }
 
     fun loadEntries(context: Context): List<FinanceEntry> {
-        val saved = prefs(context).getString(KEY_ENTRIES, null) ?: return emptyList()
+        val saved = readEncryptedString(prefs(context), KEY_ENTRIES) ?: return emptyList()
         val array = JSONArray(saved)
         return buildList {
             for (index in 0 until array.length()) {
@@ -332,12 +370,12 @@ private object FinanceStorage {
                 }
             )
         }
-        prefs(context).edit().putString(KEY_ENTRIES, array.toString()).apply()
+        writeEncryptedString(prefs(context), KEY_ENTRIES, array.toString())
         YearIncomeExpenseWidgetUpdater.updateAll(context)
     }
 
     fun loadRecurringTransactions(context: Context): List<RecurringTransaction> {
-        val saved = prefs(context).getString(KEY_RECURRING_TRANSACTIONS, null) ?: return emptyList()
+        val saved = readEncryptedString(prefs(context), KEY_RECURRING_TRANSACTIONS) ?: return emptyList()
         val array = JSONArray(saved)
         return buildList {
             for (index in 0 until array.length()) {
@@ -370,7 +408,7 @@ private object FinanceStorage {
                 }
             )
         }
-        prefs(context).edit().putString(KEY_RECURRING_TRANSACTIONS, array.toString()).apply()
+        writeEncryptedString(prefs(context), KEY_RECURRING_TRANSACTIONS, array.toString())
     }
 
     fun saveEntriesAndRecurringTransactions(
@@ -406,29 +444,30 @@ private object FinanceStorage {
             )
         }
 
-        prefs(context).edit()
-            .putString(KEY_ENTRIES, entriesArray.toString())
-            .putString(KEY_RECURRING_TRANSACTIONS, recurringArray.toString())
+        val prefs = prefs(context)
+        prefs.edit()
+            .putString(KEY_ENTRIES, encrypt(entriesArray.toString()))
+            .putString(KEY_RECURRING_TRANSACTIONS, encrypt(recurringArray.toString()))
             .apply()
         YearIncomeExpenseWidgetUpdater.updateAll(context)
     }
 
     fun loadCurrencyCode(context: Context): String {
-        return prefs(context).getString(KEY_CURRENCY, defaultCurrencyCode) ?: defaultCurrencyCode
+        return readEncryptedString(prefs(context), KEY_CURRENCY) ?: defaultCurrencyCode
     }
 
     fun saveCurrencyCode(context: Context, currencyCode: String) {
-        prefs(context).edit().putString(KEY_CURRENCY, currencyCode).apply()
+        writeEncryptedString(prefs(context), KEY_CURRENCY, currencyCode)
         YearIncomeExpenseWidgetUpdater.updateAll(context)
     }
 
     fun loadThemeMode(context: Context): ThemeMode {
-        val raw = prefs(context).getString(KEY_THEME_MODE, ThemeMode.SYSTEM.name)
+        val raw = readEncryptedString(prefs(context), KEY_THEME_MODE) ?: ThemeMode.SYSTEM.name
         return ThemeMode.entries.firstOrNull { it.name == raw } ?: ThemeMode.SYSTEM
     }
 
     fun saveThemeMode(context: Context, themeMode: ThemeMode) {
-        prefs(context).edit().putString(KEY_THEME_MODE, themeMode.name).apply()
+        writeEncryptedString(prefs(context), KEY_THEME_MODE, themeMode.name)
     }
 
     fun loadHintsEnabled(context: Context): Boolean {
@@ -463,6 +502,14 @@ private object FinanceStorage {
         prefs(context).edit().putString(KEY_AUTO_BACKUP_TREE_URI, uri).apply()
     }
 
+    fun loadBackupPassword(context: Context): String {
+        return readEncryptedString(prefs(context), KEY_BACKUP_PASSWORD).orEmpty()
+    }
+
+    fun saveBackupPassword(context: Context, password: String) {
+        writeEncryptedString(prefs(context), KEY_BACKUP_PASSWORD, password.trim())
+    }
+
     fun buildBackupData(context: Context): BackupData {
         return BackupData(
             categories = loadCategories(context),
@@ -490,9 +537,9 @@ private object FinanceStorage {
         ) ?: error("Unable to create the automatic backup file.")
     }
 
-    fun exportBackup(context: Context, uri: Uri, backupData: BackupData) {
+    fun exportBackup(context: Context, uri: Uri, backupData: BackupData, password: String = "") {
         val payload = JSONObject().apply {
-            put("version", 1)
+            put("version", BACKUP_VERSION_PLAINTEXT)
             put("currencyCode", backupData.currencyCode)
             put("themeMode", backupData.themeMode.name)
             put("hintsEnabled", backupData.hintsEnabled)
@@ -527,29 +574,68 @@ private object FinanceStorage {
                     )
                 }
             })
-        }.toString(2)
+        }.toString()
+
+        val trimmedPassword = password.trim()
+        val exportContents = if (trimmedPassword.isNotEmpty()) {
+            val salt = ByteArray(16).also(::fillWithSecureRandom)
+            JSONObject().apply {
+                put("version", BACKUP_VERSION_PASSWORD)
+                put(BACKUP_ENCRYPTED_KEY, true)
+                put(BACKUP_PASSWORD_PROTECTED_KEY, true)
+                put(BACKUP_SALT_KEY, Base64.encodeToString(salt, Base64.NO_WRAP))
+                put(BACKUP_PAYLOAD_KEY, encryptStrong(payload, backupSecretKey(trimmedPassword, salt)))
+            }.toString(2)
+        } else {
+            JSONObject().apply {
+                put("version", BACKUP_VERSION_ENCRYPTED)
+                put(BACKUP_ENCRYPTED_KEY, true)
+                put(BACKUP_PAYLOAD_KEY, encrypt(payload))
+            }.toString(2)
+        }
 
         context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
-            writer.write(payload)
+            writer.write(exportContents)
         } ?: error("Unable to open export file.")
     }
 
-    fun importBackup(context: Context, uri: Uri): BackupData {
+    fun importBackup(context: Context, uri: Uri, password: String = ""): BackupData {
         val contents = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { reader ->
             reader.readText()
         } ?: error("Unable to open backup file.")
 
         val root = JSONObject(contents)
-        val categoriesArray = root.optJSONArray("categories") ?: JSONArray()
-        val entriesArray = root.optJSONArray("entries") ?: JSONArray()
-        val recurringTransactionsArray = root.optJSONArray("recurringTransactions") ?: JSONArray()
-        val importedCurrencyCode = root.optString("currencyCode", defaultCurrencyCode)
+        val parsedContents = if (root.optBoolean(BACKUP_ENCRYPTED_KEY, false)) {
+            val encryptedPayload = root.optString(BACKUP_PAYLOAD_KEY)
+            require(encryptedPayload.isNotBlank()) { "Backup file is missing its encrypted payload." }
+            if (root.optBoolean(BACKUP_PASSWORD_PROTECTED_KEY, false)) {
+                val trimmedPassword = password.trim()
+                require(trimmedPassword.isNotEmpty()) { "Enter the backup password to import this file." }
+                val saltBase64 = root.optString(BACKUP_SALT_KEY)
+                require(saltBase64.isNotBlank()) { "Backup file is missing its password salt." }
+                val salt = Base64.decode(saltBase64, Base64.NO_WRAP)
+                runCatching {
+                    decryptStrong(encryptedPayload, backupSecretKey(trimmedPassword, salt))
+                }.getOrElse {
+                    error("The backup password is incorrect or the file is damaged.")
+                }
+            } else {
+                decrypt(encryptedPayload)
+            }
+        } else {
+            contents
+        }
+        val parsedRoot = JSONObject(parsedContents)
+        val categoriesArray = parsedRoot.optJSONArray("categories") ?: JSONArray()
+        val entriesArray = parsedRoot.optJSONArray("entries") ?: JSONArray()
+        val recurringTransactionsArray = parsedRoot.optJSONArray("recurringTransactions") ?: JSONArray()
+        val importedCurrencyCode = parsedRoot.optString("currencyCode", defaultCurrencyCode)
             .takeIf { code -> commonCurrencies.any { it.code == code } }
             ?: defaultCurrencyCode
         val importedThemeMode = ThemeMode.entries.firstOrNull {
-            it.name == root.optString("themeMode", ThemeMode.SYSTEM.name)
+            it.name == parsedRoot.optString("themeMode", ThemeMode.SYSTEM.name)
         } ?: ThemeMode.SYSTEM
-        val importedHintsEnabled = root.optBoolean("hintsEnabled", true)
+        val importedHintsEnabled = parsedRoot.optBoolean("hintsEnabled", true)
 
         val categories = buildList {
             for (index in 0 until categoriesArray.length()) {
@@ -601,6 +687,100 @@ private object FinanceStorage {
 
     private fun prefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    private fun readEncryptedString(prefs: SharedPreferences, key: String): String? {
+        val raw = prefs.getString(key, null) ?: return null
+        return when {
+            raw.startsWith(OBFUSCATED_PREFIX) -> decrypt(raw)
+            raw.startsWith(LEGACY_ENCRYPTED_PREFIX) -> {
+                val decrypted = decrypt(raw)
+                writeEncryptedString(prefs, key, decrypted)
+                decrypted
+            }
+            else -> {
+                writeEncryptedString(prefs, key, raw)
+                raw
+            }
+        }
+    }
+
+    private fun writeEncryptedString(prefs: SharedPreferences, key: String, value: String) {
+        prefs.edit().putString(key, encrypt(value)).apply()
+    }
+
+    private fun encrypt(plainText: String): String {
+        val input = plainText.toByteArray(Charsets.UTF_8)
+        val obfuscated = ByteArray(input.size)
+        for (index in input.indices) {
+            obfuscated[index] = (input[index].toInt() xor obfuscationKey[index % obfuscationKey.size].toInt()).toByte()
+        }
+        return OBFUSCATED_PREFIX + Base64.encodeToString(obfuscated, Base64.NO_WRAP)
+    }
+
+    private fun decrypt(encodedValue: String): String {
+        return when {
+            encodedValue.startsWith(OBFUSCATED_PREFIX) -> {
+                val encodedPayload = encodedValue.removePrefix(OBFUSCATED_PREFIX)
+                val obfuscated = Base64.decode(encodedPayload, Base64.NO_WRAP)
+                val plain = ByteArray(obfuscated.size)
+                for (index in obfuscated.indices) {
+                    plain[index] =
+                        (obfuscated[index].toInt() xor obfuscationKey[index % obfuscationKey.size].toInt()).toByte()
+                }
+                plain.toString(Charsets.UTF_8)
+            }
+            encodedValue.startsWith(LEGACY_ENCRYPTED_PREFIX) -> decryptStrong(encodedValue)
+            else -> encodedValue
+        }
+    }
+
+    private fun encryptStrong(plainText: String, key: SecretKeySpec = secretKey()): String {
+        val iv = ByteArray(GCM_IV_LENGTH_BYTES).also(::fillWithSecureRandom)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
+        val encrypted = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+        val combined = ByteArray(iv.size + encrypted.size)
+        System.arraycopy(iv, 0, combined, 0, iv.size)
+        System.arraycopy(encrypted, 0, combined, iv.size, encrypted.size)
+        return LEGACY_ENCRYPTED_PREFIX + Base64.encodeToString(combined, Base64.NO_WRAP)
+    }
+
+    private fun decryptStrong(encodedValue: String, key: SecretKeySpec = secretKey()): String {
+        val encodedPayload = encodedValue.removePrefix(LEGACY_ENCRYPTED_PREFIX)
+        val combined = Base64.decode(encodedPayload, Base64.NO_WRAP)
+        require(combined.size > GCM_IV_LENGTH_BYTES) { "Encrypted payload is invalid." }
+        val iv = combined.copyOfRange(0, GCM_IV_LENGTH_BYTES)
+        val encrypted = combined.copyOfRange(GCM_IV_LENGTH_BYTES, combined.size)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
+        return cipher.doFinal(encrypted).toString(Charsets.UTF_8)
+    }
+
+    private fun secretKey(): SecretKeySpec {
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val keySpec = PBEKeySpec(
+            DERIVED_SECRET.toCharArray(),
+            KEY_SALT,
+            PBKDF2_ITERATIONS,
+            AES_KEY_BITS
+        )
+        return SecretKeySpec(factory.generateSecret(keySpec).encoded, "AES")
+    }
+
+    private fun backupSecretKey(password: String, salt: ByteArray): SecretKeySpec {
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val keySpec = PBEKeySpec(
+            password.toCharArray(),
+            salt,
+            PBKDF2_ITERATIONS,
+            AES_KEY_BITS
+        )
+        return SecretKeySpec(factory.generateSecret(keySpec).encoded, "AES")
+    }
+
+    private fun fillWithSecureRandom(bytes: ByteArray) {
+        java.security.SecureRandom().nextBytes(bytes)
     }
 }
 
@@ -684,6 +864,7 @@ private fun FinanceTrackerApp(
     var autoBackupEnabled by rememberSaveable { mutableStateOf(false) }
     var autoBackupMinutes by rememberSaveable { mutableStateOf(2 * 60) }
     var autoBackupTreeUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var backupPassword by rememberSaveable { mutableStateOf("") }
     var showTitleScreen by rememberSaveable { mutableStateOf(!skipTitleScreen) }
     val selectedThemeMode = ThemeMode.valueOf(themeMode)
     val useDarkTheme = when (selectedThemeMode) {
@@ -716,6 +897,7 @@ private fun FinanceTrackerApp(
         autoBackupEnabled = FinanceStorage.loadAutoBackupEnabled(appContext)
         autoBackupMinutes = FinanceStorage.loadAutoBackupMinutes(appContext)
         autoBackupTreeUri = FinanceStorage.loadAutoBackupTreeUri(appContext)
+        backupPassword = FinanceStorage.loadBackupPassword(appContext)
         AutoBackupScheduler.sync(appContext)
         if (!skipTitleScreen) {
             delay(1800)
@@ -823,6 +1005,11 @@ private fun FinanceTrackerApp(
                     FinanceStorage.saveAutoBackupTreeUri(appContext, treeUri)
                     AutoBackupScheduler.sync(appContext)
                 },
+                backupPassword = backupPassword,
+                onBackupPasswordChange = { password ->
+                    backupPassword = password
+                    FinanceStorage.saveBackupPassword(appContext, password)
+                },
                 onAddEntry = { entry ->
                     entries.add(0, entry)
                     FinanceStorage.saveEntries(appContext, entries)
@@ -919,6 +1106,8 @@ private fun FinanceTrackerScreen(
     onAutoBackupMinutesChange: (Int) -> Unit,
     autoBackupTreeUri: String?,
     onAutoBackupTreeUriChange: (String?) -> Unit,
+    backupPassword: String,
+    onBackupPasswordChange: (String) -> Unit,
     onAddEntry: (FinanceEntry) -> Unit,
     onAddRecurringTransaction: (RecurringTransaction) -> Unit,
     onUpdateEntry: (FinanceEntry) -> Unit,
@@ -953,6 +1142,7 @@ private fun FinanceTrackerScreen(
     var pendingCategoryDelete by rememberSaveable { mutableStateOf<PendingCategoryDelete?>(null) }
     var pendingTransaction by rememberSaveable { mutableStateOf<PendingTransaction?>(null) }
     var pendingImportBackup by remember { mutableStateOf<BackupData?>(null) }
+    var pendingBackupImport by remember { mutableStateOf<PendingBackupImport?>(null) }
     var screenMenuExpanded by rememberSaveable { mutableStateOf(false) }
 
     val exportLauncher = rememberLauncherForActivityResult(
@@ -970,7 +1160,8 @@ private fun FinanceTrackerScreen(
                         currencyCode = currencyCode,
                         themeMode = themeMode,
                         hintsEnabled = hintsEnabled
-                    )
+                    ),
+                    password = backupPassword
                 )
             }.onSuccess {
                 feedbackMessage = "Backup exported successfully."
@@ -984,13 +1175,10 @@ private fun FinanceTrackerScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            runCatching {
-                FinanceStorage.importBackup(appContext, uri)
-            }.onSuccess { backup ->
-                pendingImportBackup = backup
-            }.onFailure {
-                feedbackMessage = it.message ?: "Unable to import backup."
-            }
+            pendingBackupImport = PendingBackupImport(
+                uri = uri,
+                suggestedPassword = backupPassword
+            )
         }
     }
 
@@ -1315,6 +1503,15 @@ private fun FinanceTrackerScreen(
                                 onAutoBackupMinutesChange(minutes)
                                 feedbackMessage = "Automatic backup time updated."
                             },
+                            backupPassword = backupPassword,
+                            onBackupPasswordChange = { password ->
+                                onBackupPasswordChange(password)
+                                feedbackMessage = if (password.isBlank()) {
+                                    "Backup password cleared. New backups will use the app default key."
+                                } else {
+                                    "Backup password saved."
+                                }
+                            },
                             autoBackupFolderLabel = autoBackupTreeUri
                                 ?.let(::backupFolderLabelFromUri)
                                 ?: "No backup folder selected.",
@@ -1578,6 +1775,50 @@ private fun FinanceTrackerScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingImportBackup = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    pendingBackupImport?.let { request ->
+        var passwordInput by remember(request.uri.toString()) {
+            mutableStateOf(request.suggestedPassword)
+        }
+        AlertDialog(
+            onDismissRequest = { pendingBackupImport = null },
+            title = { TitleWithAppIcon("Unlock Backup") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Enter the backup password if this file was protected with one.")
+                    OutlinedTextField(
+                        value = passwordInput,
+                        onValueChange = { passwordInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Backup password") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        runCatching {
+                            FinanceStorage.importBackup(appContext, request.uri, passwordInput)
+                        }.onSuccess { backup ->
+                            pendingBackupImport = null
+                            pendingImportBackup = backup
+                        }.onFailure {
+                            feedbackMessage = it.message ?: "Unable to import backup."
+                        }
+                    }
+                ) {
+                    Text("Continue")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingBackupImport = null }) {
                     Text("Cancel")
                 }
             }
@@ -2542,6 +2783,8 @@ private fun SettingsSection(
     onAutoBackupEnabledChange: (Boolean) -> Unit,
     autoBackupMinutes: Int,
     onAutoBackupMinutesChange: (Int) -> Unit,
+    backupPassword: String,
+    onBackupPasswordChange: (String) -> Unit,
     autoBackupFolderLabel: String,
     onChooseAutoBackupFolder: () -> Unit,
     onExportBackup: () -> Unit,
@@ -2550,6 +2793,7 @@ private fun SettingsSection(
     val context = LocalContext.current
     var currencyMenuExpanded by remember { mutableStateOf(false) }
     var themeMenuExpanded by remember { mutableStateOf(false) }
+    var passwordInput by remember(backupPassword) { mutableStateOf(backupPassword) }
     val selectedCurrency = commonCurrencies.firstOrNull { it.code == selectedCurrencyCode }
         ?: commonCurrencies.first()
 
@@ -2633,6 +2877,37 @@ private fun SettingsSection(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            OutlinedTextField(
+                value = passwordInput,
+                onValueChange = { passwordInput = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Backup password") },
+                supportingText = {
+                    Text("This password is stored on the device and used for manual and automatic backups.")
+                },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation()
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    onClick = { onBackupPasswordChange(passwordInput) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(if (backupPassword.isBlank()) "Save Password" else "Update Password")
+                }
+                OutlinedButton(
+                    onClick = {
+                        passwordInput = ""
+                        onBackupPasswordChange("")
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Clear Password")
+                }
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -3696,6 +3971,8 @@ private fun FinanceTrackerPreview() {
             onAutoBackupMinutesChange = {},
             autoBackupTreeUri = null,
             onAutoBackupTreeUriChange = {},
+            backupPassword = "",
+            onBackupPasswordChange = {},
             onAddEntry = {},
             onAddRecurringTransaction = {},
             onUpdateEntry = {},
