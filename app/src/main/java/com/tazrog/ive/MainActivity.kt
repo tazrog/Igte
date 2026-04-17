@@ -2285,26 +2285,34 @@ private fun StatsSection(
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                SummaryTile("$periodLabel Income", formatCurrency(monthIncome, currencyCode), positiveColor, Modifier.weight(1f))
-                SummaryTile("$periodLabel Expense", formatCurrency(monthExpense, currencyCode), negativeColor, Modifier.weight(1f))
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                SummaryTile("$periodLabel Net", formatSignedCurrency(monthNet, currencyCode), neutralColor, Modifier.weight(1f))
-                SummaryTile("Year Net", formatSignedCurrency(yearNet, currencyCode), neutralColor, Modifier.weight(1f))
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                SummaryTile("Year Income", formatCurrency(yearIncome, currencyCode), positiveColor, Modifier.weight(1f))
-                SummaryTile("Year Expense", formatCurrency(yearExpense, currencyCode), negativeColor, Modifier.weight(1f))
+            if (selectedMonth == allYearMonth) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SummaryTile("Year Income", formatCurrency(yearIncome, currencyCode), positiveColor, Modifier.weight(1f))
+                    SummaryTile("Year Expense", formatCurrency(yearExpense, currencyCode), negativeColor, Modifier.weight(1f))
+                }
+                SummaryTile(
+                    "Year Net",
+                    formatSignedCurrency(yearNet, currencyCode),
+                    neutralColor,
+                    Modifier.fillMaxWidth()
+                )
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SummaryTile("$periodLabel Income", formatCurrency(monthIncome, currencyCode), positiveColor, Modifier.weight(1f))
+                    SummaryTile("$periodLabel Expense", formatCurrency(monthExpense, currencyCode), negativeColor, Modifier.weight(1f))
+                }
+                SummaryTile(
+                    "$periodLabel Net",
+                    formatSignedCurrency(monthNet, currencyCode),
+                    neutralColor,
+                    Modifier.fillMaxWidth()
+                )
             }
         }
     }
